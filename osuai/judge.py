@@ -330,13 +330,18 @@ def judge_replay(beatmap: Beatmap, frames: list[Frame], score_multiplier: float 
         spins_required = int(min_rps * sec + 0.0001)
         max_bonus = max(0, int(max_rps * sec + 0.0001) - spins_required - 2)
         # SpinnerRotationTracker: per update, the angle change around the centre is wrapped to +-180 degrees and
-        # added with its sign while a key is held inside [start, end); the angle is tracked even when not spinning
+        # added with its sign while a key is held inside [start, end); the angle is tracked even when not spinning.
+        # Replay playback moves the cursor in a straight line from one frame to the next under the keys of the frame
+        # it leaves, so each move counts with the previous frame's keys (a straight move sweeps under 180 degrees,
+        # so one wrapped difference equals lazer's sum over its updates)
         lo = max(bisect.bisect_left(inp.times, o.time) - 1, 0)
         hi = bisect.bisect_left(inp.times, o.end_time)
-        net, prev = 0.0, None
+        net, prev, prev_keys = 0.0, None, 0
         for f in inp.frames[lo:hi]:
             ang = math.degrees(math.atan2(f.y - o.pos.y, f.x - o.pos.x))
-            if prev is not None and f.time >= o.time and inp.actions(f.keys):
+            held = bool(inp.actions(prev_keys))
+            prev_keys = f.keys
+            if prev is not None and f.time >= o.time and held:
                 delta = ang - prev
                 if delta > 180.0:
                     delta -= 360.0
