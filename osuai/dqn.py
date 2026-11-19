@@ -252,7 +252,7 @@ class DQNConfig:
     key_explore_prob: float = 0.2  # a random key action holds the key down this often (osu! punishes spam)
     grad_clip: float = 10.0
     eval_interval: int = 100_000
-    eval_maps: int = 3
+    eval_maps: int = 6  # validation maps per evaluation, spread over the round's star range
     eval_seconds: float = 60.0
     log_interval: int = 10_000
     seed: int = 0
@@ -285,6 +285,7 @@ def save_checkpoint(
     history: list[dict] | None = None,
     all_train_maps: list[str] | None = None,
     all_val_maps: list[str] | None = None,
+    eval_maps: list[str] | None = None,
 ) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -306,6 +307,8 @@ def save_checkpoint(
             # roles over every round so far, so later rounds never validate on a map that was trained on
             "all_train_maps": sorted(set(all_train_maps if all_train_maps is not None else train_maps)),
             "all_val_maps": sorted(set(all_val_maps if all_val_maps is not None else val_maps)),
+            # the maps this round evaluated on; the next round evaluates them again to compare rounds like for like
+            "eval_maps": list(eval_maps if eval_maps is not None else val_maps[: dqn_cfg.eval_maps]),
         },
         p,
     )
@@ -324,6 +327,7 @@ class LoadedAgent:
     history: list[dict] = field(default_factory=list)
     all_train_maps: list[str] = field(default_factory=list)  # every map trained on in any round so far
     all_val_maps: list[str] = field(default_factory=list)  # every map held out for validation in any round so far
+    eval_maps: list[str] = field(default_factory=list)  # the maps this checkpoint's round evaluated on
 
 
 def load_checkpoint(path: str | Path, device: str | torch.device | None = None) -> LoadedAgent:
@@ -357,7 +361,21 @@ def load_checkpoint(path: str | Path, device: str | torch.device | None = None) 
         history=list(ck.get("history", [])),
         all_train_maps=list(ck.get("all_train_maps", ck["train_maps"])),
         all_val_maps=list(ck.get("all_val_maps", ck["val_maps"])),
+        # older checkpoints evaluated on the first maps of their validation list
+        eval_maps=list(ck.get("eval_maps", ck["val_maps"][: dqn_cfg.eval_maps])),
     )
+
+
+def pick_eval_maps(ids: list[str], stars: dict[str, float], k: int) -> list[str]:
+    """k maps spread evenly over the star range of `ids` (easiest, hardest and evenly in between), deterministic."""
+    ranked = sorted(ids, key=lambda m: (stars.get(m, 0.0), m))
+    if k <= 0:
+        return []
+    if len(ranked) <= k:
+        return ranked
+    if k == 1:
+        return [ranked[len(ranked) // 2]]
+    return [ranked[round(i * (len(ranked) - 1) / (k - 1))] for i in range(k)]
 
 
 def collect_map_roles(agent: LoadedAgent) -> tuple[set[str], set[str]]:
@@ -454,12 +472,18 @@ def train_dqn(
     log=print,
     resume: LoadedAgent | None = None,
     round_info: dict | None = None,
+    eval_maps: list[MapData] | None = None,
+    prev_eval_maps: list[MapData] | None = None,
 ) -> dict:
     """Train a DQN agent on random windows of the training maps; keeps the best checkpoint by validation reward.
 
     Everything of this round goes into `out_dir` (best.pt, last.pt, log.jsonl, round.json). With `resume`, training continues from that checkpoint's network weights and optimizer state (e.g. for a
     star-rating curriculum: <4* maps first, then 4-5*, ...). The replay buffer always starts empty, cfg.total_steps
     counts this round only, and the step stored in checkpoints is cumulative across rounds.
+
+    Evaluations play `eval_maps` (default: the first cfg.eval_maps validation maps); best.pt is chosen on them. With
+    `prev_eval_maps` (the maps the previous round evaluated on), every evaluation also plays those and logs them as
+    eval_prev_*, so a round can be compared with how the one before it ended on the same maps.
     """
     run_dir = Path(out_dir)
     if run_dir.suffix == ".pt":
@@ -471,6 +495,9 @@ def train_dqn(
     summary_path = run_dir / ROUND_FILE
     train_names = train_names or [m.bm.md5 for m in train_maps]
     val_names = val_names or [m.bm.md5 for m in val_maps]
+    eval_set = list(eval_maps) if eval_maps is not None else list(val_maps[: cfg.eval_maps])
+    prev_set = list(prev_eval_maps or [])
+    eval_names = [m.bm.md5 for m in eval_set]
 
     prev_history = list(resume.history) if resume is not None else []
     round_no = len(prev_history) + 1
@@ -517,7 +544,9 @@ def train_dqn(
     log(
         f"[dqn] device={device} grid={grid_hw[1]}x{grid_hw[0]} keys={n_keys} decision_hz={env_cfg.decision_hz:g} "
         f"obs={cfg.frame_stack}x{obs_hw[0]}x{obs_hw[1]} "
-        f"train_maps={len(train_maps)} val_maps={len(val_maps)} buffer={buf.C * cfg.n_envs:,} "
+        f"train_maps={len(train_maps)} val_maps={len(val_maps)} eval_maps={len(eval_set)}"
+        + (f" (+{len(prev_set)} from the previous round)" if prev_set else "")
+        + f" buffer={buf.C * cfg.n_envs:,} "
         f"({buf.frames.nbytes / 1e9:.2f} GB)"
     )
 
@@ -552,7 +581,7 @@ def train_dqn(
     def save(path: Path) -> None:
         save_checkpoint(
             path, online, env_cfg, cfg, train_names, val_names, base_step + step, last_metrics, opt, history_now(),
-            all_train_maps=all_train, all_val_maps=all_val,
+            all_train_maps=all_train, all_val_maps=all_val, eval_maps=eval_names,
         )
 
     def write_summary(done: bool) -> None:
@@ -570,24 +599,33 @@ def train_dqn(
             "dqn_cfg": cfg.to_dict(),
             "train_maps": train_names,
             "val_maps": val_names,
+            "eval_maps": eval_names,
+            "prev_eval_maps": [m.bm.md5 for m in prev_set],
         }
         summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    def evaluate() -> dict:
-        if not val_maps:
-            return {}
-        picks = val_maps[: cfg.eval_maps]
-        results = []
-        for md in picks:
-            _, st = play_map(online, env_cfg, md, cfg.frame_stack, max_seconds=cfg.eval_seconds)
-            results.append(st)
-        online.train()
+    def play_set(maps: list[MapData], prefix: str, played: dict[str, PlayStats]) -> dict:
+        # greedy play is deterministic, so a map in both sets is played once per evaluation and its result reused
+        for md in maps:
+            if md.bm.md5 not in played:
+                played[md.bm.md5] = play_map(online, env_cfg, md, cfg.frame_stack, max_seconds=cfg.eval_seconds)[1]
+        results = [played[md.bm.md5] for md in maps]
         return {
-            "eval_reward": float(np.mean([s.reward for s in results])),
-            "eval_accuracy": float(np.mean([s.accuracy for s in results])),
-            "eval_hit_rate": float(np.mean([s.hit_rate for s in results])),
-            "eval_max_combo": float(np.mean([s.max_combo for s in results])),
+            f"{prefix}_reward": float(np.mean([s.reward for s in results])),
+            f"{prefix}_accuracy": float(np.mean([s.accuracy for s in results])),
+            f"{prefix}_hit_rate": float(np.mean([s.hit_rate for s in results])),
+            f"{prefix}_max_combo": float(np.mean([s.max_combo for s in results])),
         }
+
+    def evaluate() -> dict:
+        if not eval_set:
+            return {}
+        played: dict[str, PlayStats] = {}
+        ev = play_set(eval_set, "eval", played)
+        if prev_set:
+            ev.update(play_set(prev_set, "eval_prev", played))
+        online.train()
+        return ev
 
     online.train()
     while step < cfg.total_steps:

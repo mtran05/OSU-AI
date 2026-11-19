@@ -386,6 +386,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         collect_map_roles,
         load_checkpoint,
         load_manifest_entries,
+        pick_eval_maps,
         resolve_checkpoint,
         split_maps,
         train_dqn,
@@ -461,6 +462,20 @@ def cmd_train(args: argparse.Namespace) -> int:
     ):
         if value < 0:
             raise ValueError(f"{flag} is an amount taken off the reward: pass a positive number (or 0 to turn it off), got {value}")
+    # --reward-* are signed: hits earn (0 or more), misses cost (0 or less), and a better grade never earns less
+    for flag, value, sign in (
+        ("--reward-300", args.reward_300, 1), ("--reward-100", args.reward_100, 1), ("--reward-50", args.reward_50, 1),
+        ("--reward-tick", args.reward_tick, 1), ("--reward-tail", args.reward_tail, 1),
+        ("--reward-miss", args.reward_miss, -1), ("--reward-tick-miss", args.reward_tick_miss, -1),
+    ):
+        if value * sign < 0:
+            kind = "a hit: pass 0 or more" if sign > 0 else "a miss: pass 0 or less (e.g. -0.1)"
+            raise ValueError(f"{flag} is the reward for {kind}, got {value}")
+    if not args.reward_50 <= args.reward_100 <= args.reward_300:
+        raise ValueError(
+            f"Hit rewards must keep --reward-50 <= --reward-100 <= --reward-300, got "
+            f"{args.reward_50} / {args.reward_100} / {args.reward_300}"
+        )
     env_cfg = EnvConfig(
         hz=hz,
         action_repeat=action_repeat,
@@ -477,6 +492,13 @@ def cmd_train(args: argparse.Namespace) -> int:
         r_spin_bonus=args.spin_bonus,
         slider_break_penalty=args.slider_break_penalty,
         slider_offset_cost=args.slider_offset_cost,
+        r300=args.reward_300,
+        r100=args.reward_100,
+        r50=args.reward_50,
+        r_miss=args.reward_miss,
+        r_tick=args.reward_tick,
+        r_tick_miss=args.reward_tick_miss,
+        r_tail=args.reward_tail,
     )
     cfg = DQNConfig(
         total_steps=args.steps,
@@ -496,15 +518,20 @@ def cmd_train(args: argparse.Namespace) -> int:
         key_explore_prob=args.key_explore,
         eps_end=args.eps_end,
         eval_interval=args.eval_interval,
+        eval_maps=args.eval_maps,
         log_interval=args.log_interval,
         seed=args.seed,
     )
 
+    if args.eval_maps < 1:
+        raise ValueError(f"--eval-maps must be at least 1, got {args.eval_maps}")
     beatmaps: dict[str, MapData] = {}
+    stars: dict[str, float] = {}
     for e in entries:
         try:
             bm = parse_osu(e["path"], mods=e.get("mods", ["NM"]))
             beatmaps[bm.md5] = MapData(bm, env_cfg)
+            stars[bm.md5] = float(e.get("star_rating", 0.0))
         except Exception as exc:  # skip unparsable maps but say so
             print(f"[train] skipping {e['path']}: {exc}")
     # A map keeps its role across rounds: anything ever trained on stays training, earlier validation maps stay
@@ -522,6 +549,17 @@ def cmd_train(args: argparse.Namespace) -> int:
     if not train_ids:
         raise ValueError("No training maps left after the split")
     print(f"[train] {len(train_ids)} training maps, {len(val_ids)} validation maps")
+    # this round evaluates on maps spread over its star range; the previous round's eval maps are played too
+    eval_ids = pick_eval_maps(val_ids, stars, cfg.eval_maps)
+    prev_eval: list[MapData] = []
+    for md5 in resume.eval_maps if resume is not None else []:
+        if md5 in beatmaps:
+            prev_eval.append(beatmaps[md5])
+            continue
+        try:
+            prev_eval.append(MapData(parse_osu(_find_map(md5)), env_cfg))
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"[train] previous round's eval map {md5} is unavailable, comparing without it: {exc}")
     result = train_dqn(
         train_maps=[beatmaps[k] for k in train_ids],
         val_maps=[beatmaps[k] for k in val_ids],
@@ -531,6 +569,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         train_names=train_ids,
         val_names=val_ids,
         resume=resume,
+        eval_maps=[beatmaps[k] for k in eval_ids],
+        prev_eval_maps=prev_eval,
         round_info={
             "manifest": [str(m).replace("\\", "/") for m in manifests],
             "min_stars": args.min_stars,
@@ -780,6 +820,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--episode-seconds", type=float, default=30.0, help="Length of each random training window")
     p_tr.add_argument("--aim-shaping", type=float, default=0.5, help="Potential-based aim shaping weight (0 = pure game reward)")
     p_tr.add_argument("--press-penalty", type=float, default=0.005, help="Taken off the reward per key press (a positive number)")
+    # --reward-* are signed rewards (hits 0 or more, misses 0 or less); --*-penalty / --*-cost are positive amounts
+    p_tr.add_argument("--reward-300", type=float, default=1.0, help="Reward for a 300 (circle, slider head or spinner)")
+    p_tr.add_argument(
+        "--reward-100", type=float, default=1.0 / 3.0,
+        help="Reward for a 100 (default 1/3, lazer's accuracy weight). Lower makes timing matter more",
+    )
+    p_tr.add_argument("--reward-50", type=float, default=1.0 / 6.0, help="Reward for a 50 (default 1/6, lazer's accuracy weight)")
+    p_tr.add_argument(
+        "--reward-miss", type=float, default=-0.1,
+        help="Reward for a missed circle, slider head or spinner (0 or less; kept small so hits stand out early in training)",
+    )
+    p_tr.add_argument("--reward-tick", type=float, default=0.1, help="Reward for a slider tick or repeat")
+    p_tr.add_argument("--reward-tick-miss", type=float, default=-0.02, help="Reward for a missed slider tick or repeat (0 or less)")
+    p_tr.add_argument("--reward-tail", type=float, default=0.5, help="Reward for a slider end")
     p_tr.add_argument(
         "--spin-reward", type=float, default=0.5,
         help="Reward per spinner rotation toward the spins its 300 needs, paid tick by tick as the net rotation grows",
@@ -791,7 +845,7 @@ def build_parser() -> argparse.ArgumentParser:
         "(a positive number; 0 = off)",
     )
     p_tr.add_argument(
-        "--slider-offset-cost", type=float, default=0.3,
+        "--slider-offset-cost", type=float, default=1.0,
         help="Taken off the reward per second of a slider in progress with the cursor at the follow circle's edge, linear in "
         "distance from the ball (a positive number; 0 = off)",
     )
@@ -810,6 +864,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--eps-decay", type=int, default=250_000, help="Transitions over which epsilon decays eps-start -> eps-end")
     p_tr.add_argument("--eps-end", type=float, default=0.05, help="Final exploration epsilon")
     p_tr.add_argument("--eval-interval", type=int, default=100_000, help="Transitions between validation evaluations")
+    p_tr.add_argument(
+        "--eval-maps", type=int, default=6,
+        help="Validation maps per evaluation, spread over the round's star range (the previous round's are played too)",
+    )
     p_tr.add_argument("--log-interval", type=int, default=10_000, help="Transitions between progress log lines")
     p_tr.add_argument("--seed", type=int, default=0, help="Random seed")
     p_tr.set_defaults(func=cmd_train)
