@@ -61,9 +61,11 @@ class EnvConfig:
     aim_shaping: float = 0.5  # weight of the shaping term (0 disables it)
     # r_* are signed rewards; *_penalty and *_cost are positive amounts taken off the reward
     press_penalty: float = 0.005  # cost per key press, discourages pointless clicking
+    # 100 and 50 are worth 1/3 and 1/6 of a 300, the weights of lazer's accuracy, so timing matters as much as it
+    # does to the score: a press one tick late that drops a 300 to a 100 loses two thirds of the hit
     r300: float = 1.0
-    r100: float = 0.5
-    r50: float = 0.25
+    r100: float = 1.0 / 3.0
+    r50: float = 1.0 / 6.0
     r_miss: float = -0.1  # circles and slider heads alike
     r_tick: float = 0.1  # slider tick or repeat (30 points in lazer)
     r_tick_miss: float = -0.02
@@ -71,7 +73,7 @@ class EnvConfig:
     r_spin: float = 0.5  # per rotation toward the spins a spinner's 300 needs, paid tick by tick as net rotation grows
     r_spin_bonus: float = 0.1  # per rotation beyond those
     slider_break_penalty: float = 0.3  # a tracked slider lost before its end (key let go, or cursor out of the follow circle)
-    slider_offset_cost: float = 0.3  # per second of a slider in progress at the follow circle's edge, linear in distance
+    slider_offset_cost: float = 1.0  # per second of a slider in progress at the follow circle's edge, linear in distance
 
     @property
     def dt_ms(self) -> float:
