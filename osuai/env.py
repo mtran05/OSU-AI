@@ -1,6 +1,6 @@
 """Step-wise osu!standard game simulation used as a reinforcement-learning environment.
 
-The agent observes ONLY the rendered black-and-white frame (see osuai/render.py) and acts with a discrete
+The agent observes ONLY the rendered grayscale frame (see osuai/render.py) and acts with a discrete
 *spatial* action: a cell of a grid laid over the playfield (where to aim) combined with a key state: no key, K1
 or K2. Pressing the other key than the one held is a fresh tap, so alternating K1/K2 (like a human streaming)
 allows a new tap every decision.
@@ -60,7 +60,12 @@ class EnvConfig:
     gamma: float = 0.9  # per-decision discount used for the potential-based aim shaping term
     aim_shaping: float = 0.5  # weight of the shaping term (0 disables it)
     # r_* are signed rewards; *_penalty and *_cost are positive amounts taken off the reward
-    press_penalty: float = 0.005  # cost per key press, discourages pointless clicking
+    # per key press (a key going down, so switching K1 <-> K2 while holding counts too): large enough that flipping
+    # between keys that look equally good is not free, small next to a hit
+    press_penalty: float = 0.03
+    # per second a key is held while nothing needs one (no slider in progress, no spinner running): holding is otherwise
+    # free, and an agent that always holds a key "presses" by switching keys, which hits upcoming circles too early
+    hold_cost: float = 0.2
     # 100 and 50 are worth 1/3 and 1/6 of a 300, the weights of lazer's accuracy, so timing matters as much as it
     # does to the score: a press one tick late that drops a 300 to a 100 loses two thirds of the hit
     r300: float = 1.0
@@ -163,6 +168,7 @@ class PlayStats:
     combo: int = 0
     max_combo: int = 0
     slider_breaks: int = 0  # tracked sliders lost before their end
+    idle_hold_ticks: int = 0  # ticks with a key held while nothing needed one
     reward: float = 0.0
     steps: int = 0
 
@@ -405,6 +411,7 @@ class OsuEnv:
         # 3. Sliders and spinners that have started
         hi_started = bisect.bisect_right(md.times_list, t1)
         self.tracking = -1
+        key_needed = False  # a slider in progress (head judged) or a spinner running wants a key held
         for j in range(self.lo, hi_started):
             if self.done[j]:
                 continue
@@ -412,9 +419,14 @@ class OsuEnv:
             if kind == KIND_SLIDER:
                 if self.head_pending[j]:
                     continue
+                key_needed = True
                 reward += self._update_slider(j, t1)
             elif kind == KIND_SPINNER:
+                key_needed = key_needed or t1 < md.ends[j]
                 reward += self._update_spinner(j, t1)
+        if self.key_down and not key_needed:
+            self.stats.idle_hold_ticks += 1
+            reward -= cfg.hold_cost * cfg.dt_ms / 1000.0
         while self.lo < md.n and self.done[self.lo]:
             self.lo += 1
 

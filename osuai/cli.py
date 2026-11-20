@@ -457,6 +457,7 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     for flag, value in (
         ("--press-penalty", args.press_penalty),
+        ("--hold-cost", args.hold_cost),
         ("--slider-break-penalty", args.slider_break_penalty),
         ("--slider-offset-cost", args.slider_offset_cost),
     ):
@@ -488,6 +489,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         episode_seconds=args.episode_seconds,
         aim_shaping=args.aim_shaping,
         press_penalty=args.press_penalty,
+        hold_cost=args.hold_cost,
         r_spin=args.spin_reward,
         r_spin_bonus=args.spin_bonus,
         slider_break_penalty=args.slider_break_penalty,
@@ -624,7 +626,7 @@ def _parse_seconds(value: str) -> float:
 
 
 def cmd_render(args: argparse.Namespace) -> int:
-    """Preview the simulated black-and-white frames, as a PNG contact sheet or an animated GIF.
+    """Preview the simulated grayscale frames, as a PNG contact sheet or an animated GIF.
 
     With --checkpoint the trained agent plays and its cursor and keys are shown; without it only the map is shown
     (objects appearing, approaching and disappearing, no cursor). With --gif the animation runs in real map time
@@ -752,7 +754,7 @@ def cmd_render(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="python osuai/cli.py", description="osu! DQN agent that learns to play from simulated black-and-white frames")
+    p = argparse.ArgumentParser(prog="python osuai/cli.py", description="osu! DQN agent that learns to play from simulated grayscale frames")
     sub = p.add_subparsers(dest="command", required=True)
 
     p_imp = sub.add_parser("import-lazer", help="Extract real .osu beatmaps from osu!lazer store into maps/imported/")
@@ -794,7 +796,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bch.add_argument("--limit", type=int, default=0, help="Only benchmark the first N maps (0 = all)")
     p_bch.set_defaults(func=cmd_bench)
 
-    p_tr = sub.add_parser("train", help="Train the DQN agent on simulated black-and-white frames")
+    p_tr = sub.add_parser("train", help="Train the DQN agent on simulated grayscale frames")
     p_tr.add_argument("--maps", nargs="+", default=None, help="Manifests or map folders to train on, e.g. maps/imported maps/synthetic (default: maps/imported/manifest.json)")
     p_tr.add_argument("--out", default=None, help="Folder for this round's best.pt / last.pt / log.jsonl / round.json (default: checkpoints/round<N>_<stars>)")
     p_tr.add_argument("--force", action="store_true", help="Overwrite the --out folder if it already holds a training round")
@@ -819,7 +821,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--grid", default=None, help="Aim grid as COLSxROWS, e.g. 16x12 (coarser) or 32x24 (finer, needs --width 128); one number = columns, rows follow 4:3 (default 24x18; fixed when resuming)")
     p_tr.add_argument("--episode-seconds", type=float, default=30.0, help="Length of each random training window")
     p_tr.add_argument("--aim-shaping", type=float, default=0.5, help="Potential-based aim shaping weight (0 = pure game reward)")
-    p_tr.add_argument("--press-penalty", type=float, default=0.005, help="Taken off the reward per key press (a positive number)")
+    p_tr.add_argument(
+        "--press-penalty", type=float, default=0.03,
+        help="Taken off the reward per key press, including switching K1 <-> K2 while holding (a positive number)",
+    )
+    p_tr.add_argument(
+        "--hold-cost", type=float, default=0.2,
+        help="Taken off the reward per second a key is held while nothing needs one: no slider in progress, no spinner "
+        "running (a positive number; 0 = off)",
+    )
     # --reward-* are signed rewards (hits 0 or more, misses 0 or less); --*-penalty / --*-cost are positive amounts
     p_tr.add_argument("--reward-300", type=float, default=1.0, help="Reward for a 300 (circle, slider head or spinner)")
     p_tr.add_argument(
