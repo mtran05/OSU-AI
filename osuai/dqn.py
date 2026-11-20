@@ -1,4 +1,4 @@
-"""Deep Q-Network agent that learns osu! from simulated black-and-white frames.
+"""Deep Q-Network agent that learns osu! from simulated grayscale frames.
 
 Kept from DeepMind's DQN (Mnih et al. 2015): the observation is the last 4 rendered frames, experience replay,
 a periodically synced target network, epsilon-greedy exploration, Huber loss, and action repeat (the env decides
