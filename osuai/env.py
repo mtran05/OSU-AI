@@ -66,6 +66,10 @@ class EnvConfig:
     # per second a key is held while nothing needs one (no slider in progress, no spinner running): holding is otherwise
     # free, and an agent that always holds a key "presses" by switching keys, which hits upcoming circles too early
     hold_cost: float = 0.2
+    # extra cost of a press that hits nothing: no circle or slider head judged, no slider in progress, no spinner
+    # running or about to start. Pressing again right after a hit is otherwise nearly free, and when the cursor is
+    # already on the next object (or it is stacked on the same spot) that extra press hits it a beat early: a miss
+    empty_press_cost: float = 0.1
     # 100 and 50 are worth 1/3 and 1/6 of a 300, the weights of lazer's accuracy, so timing matters as much as it
     # does to the score: a press one tick late that drops a 300 to a 100 loses two thirds of the hit
     # an early hit (before the object's time) is paid on the tick the object's time comes, not on the press: with
@@ -179,6 +183,7 @@ class PlayStats:
     max_combo: int = 0
     slider_breaks: int = 0  # tracked sliders lost before their end
     idle_hold_ticks: int = 0  # ticks with a key held while nothing needed one
+    empty_presses: int = 0  # presses that hit nothing (see EnvConfig.empty_press_cost)
     reward: float = 0.0
     steps: int = 0
 
@@ -402,6 +407,7 @@ class OsuEnv:
         self._advance_head_ptr()
 
         # 2. A press hits the earliest waiting circle / head under the cursor, unless note lock blocks it
+        press_judged = False
         if pressed:
             hi_visible = bisect.bisect_right(md.appear_list, t1)
             for j in range(self.head_ptr, hi_visible):
@@ -418,6 +424,7 @@ class OsuEnv:
                     if self.head_pending[k] and md.times[k] < md.times[j]:
                         reward += self._judge_head(k, None)
                 reward += self._judge_head(j, t1 - md.times[j])
+                press_judged = True
                 break
             self._advance_head_ptr()
 
@@ -440,6 +447,9 @@ class OsuEnv:
         if self.key_down and not key_needed:
             self.stats.idle_hold_ticks += 1
             reward -= cfg.hold_cost * cfg.dt_ms / 1000.0
+        if pressed and not press_judged and not key_needed and not self._spinner_soon(t1):
+            self.stats.empty_presses += 1
+            reward -= cfg.empty_press_cost
         while self.lo < md.n and self.done[self.lo]:
             self.lo += 1
 
@@ -505,6 +515,13 @@ class OsuEnv:
             self.pending.append((float(md.times[j]), reward))  # paid when the object's time comes
             return 0.0
         return reward
+
+    def _spinner_soon(self, t1: float, within: float = 100.0) -> bool:
+        """A spinner starts within `within` ms after t1 (pressing just before it is preparation, not a wasted press)."""
+        md = self.md
+        lo = bisect.bisect_right(md.times_list, t1)
+        hi = bisect.bisect_right(md.times_list, t1 + within)
+        return any(md.kinds[k] == KIND_SPINNER for k in range(lo, hi))
 
     def _pay_pending(self, t1: float | None = None) -> float:
         """Pay the early hits whose object time has come by t1 (all of them when t1 is None)."""

@@ -818,3 +818,45 @@ def test_early_hits_are_paid_at_the_objects_time():
     assert env_end.stats.n300 == 1 and np.isclose(r_end[-1], cfg.r300 - cfg.press_penalty - hold_tick) and not env_end.pending
     _, r_cut, env_cut = run(True, 1975, cut_after_press=True)
     assert env_cut.stats.n300 == 1 and r_cut[-1] > cfg.r300 - 0.1 and not env_cut.pending
+
+
+def test_a_press_that_hits_nothing_costs_extra():
+    cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
+
+    def env_for(objs: str) -> OsuEnv:
+        env = OsuEnv(MapData(parse_osu(_one_object_map(objs)), cfg), cfg)
+        env.reset(mode="full")
+        return env
+
+    def until(env: OsuEnv, t: float, x: float, y: float, key: int = 0) -> None:
+        while env.t + cfg.dt_ms < t:
+            env.step_raw(x, y, key)
+
+    # a press in empty space: the press penalty plus the empty-press cost (plus one tick of idle holding)
+    env = env_for("256,192,4000,1,0")
+    until(env, 1000, 50, 50)
+    _, r, _, _ = env.step_raw(50, 50, KEY_K1)
+    assert env.stats.empty_presses == 1
+    assert np.isclose(r, -cfg.press_penalty - cfg.empty_press_cost - cfg.hold_cost * cfg.dt_ms / 1000.0)
+    # a press that hits a circle, or one far too early on it (a miss), judged something: no extra cost
+    for press_at in (4000 - 8, 4000 - 300):
+        env = env_for("256,192,4000,1,0\n256,192,6000,1,0")
+        until(env, press_at, 256, 192)
+        env.step_raw(256, 192, KEY_K1)
+        assert env.stats.empty_presses == 0 and env.stats.n300 + env.stats.n_miss == 1
+    # pressing again during a slider (to pick it back up) or a spinner, or just before a spinner, is not wasted
+    slider = "100,192,2000,2,0,L|400:192,1,300\n256,192,6000,1,0"
+    obj = parse_osu(_one_object_map(slider)).objects[0]
+    env = env_for(slider)
+    until(env, obj.time - 8, 100, 192)
+    t = obj.time - 8
+    while env.t + cfg.dt_ms < obj.time + 600:
+        t1 = env.t + cfg.dt_ms
+        b = obj.slider_pos_at_time(min(max(t1, obj.time), obj.end_time))
+        env.step_raw(b.x, b.y, 0 if obj.time + 300 <= t1 < obj.time + 340 else KEY_K1)  # let go for a moment
+    assert env.stats.empty_presses == 0 and env.stats.presses == 2
+    for press_at in (2000 - 50, 2500):
+        env = env_for("256,192,2000,8,0,5000\n256,192,8000,1,0")
+        until(env, press_at, 316, 192)
+        env.step_raw(316, 192, KEY_K1)
+        assert env.stats.empty_presses == 0
