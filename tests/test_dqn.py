@@ -776,3 +776,45 @@ def test_spin_reward_credits_at_most_spin_max_deg_per_tick():
         ang += 90.0
         _, rew, _, _ = env.step_raw(256 + 60 * np.cos(np.radians(ang)), 192 + 60 * np.sin(np.radians(ang)), KEY_K1)
     assert np.isclose(rew, free.r_spin / 4.0)
+
+
+def test_early_hits_are_paid_at_the_objects_time():
+    two = "256,192,2000,1,0\n256,192,4000,1,0"
+
+    def run(pay_on_time: bool, press_at: float, obj: str = two, cut_after_press: bool = False) -> tuple[list[float], list[float], OsuEnv]:
+        cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False, pay_hits_on_time=pay_on_time)
+        env = OsuEnv(MapData(parse_osu(_one_object_map(obj)), cfg), cfg)
+        env.reset(mode="full")
+        times, rewards, done = [], [], False
+        while not done and env.t + cfg.dt_ms < 2300:
+            t1 = env.t + cfg.dt_ms
+            pressing = press_at <= t1 < press_at + cfg.dt_ms
+            if pressing and cut_after_press:
+                env.max_steps = env.stats.steps + 1  # this decision ends the episode
+            _, r, terminal, truncated = env.step_raw(256, 192, KEY_K1 if pressing else 0)
+            times.append(t1)
+            rewards.append(r)
+            done = terminal or truncated
+        return times, rewards, env
+
+    cfg = EnvConfig()
+    # an early 300 (about 25 ms early, inside OD 5's +-44.5 ms window) is paid on the first tick at or after 2000 ms
+    t_on, r_on, env_on = run(True, 1975)
+    t_off, r_off, _ = run(False, 1975)
+    assert env_on.stats.n300 == 1
+    press = next(i for i, t in enumerate(t_off) if 1975 <= t)
+    due = next(i for i, t in enumerate(t_on) if t >= 2000)
+    assert due > press
+    diff = np.array(r_on) - np.array(r_off)
+    assert np.isclose(diff[press], -cfg.r300) and np.isclose(diff[due], cfg.r300)
+    assert np.isclose(np.delete(diff, [press, due]), 0).all() and np.isclose(sum(r_on), sum(r_off))
+    # a late hit is paid on the press either way
+    t_on, r_on, _ = run(True, 2010)
+    _, r_off, _ = run(False, 2010)
+    assert np.allclose(r_on, r_off)
+    # the map ending or the episode being cut short pays what is still waiting
+    _, r_end, env_end = run(True, 1975, obj="256,192,2000,1,0")
+    hold_tick = cfg.hold_cost * cfg.dt_ms / 1000.0  # the key is still down on the hit's tick, with nothing to hold
+    assert env_end.stats.n300 == 1 and np.isclose(r_end[-1], cfg.r300 - cfg.press_penalty - hold_tick) and not env_end.pending
+    _, r_cut, env_cut = run(True, 1975, cut_after_press=True)
+    assert env_cut.stats.n300 == 1 and r_cut[-1] > cfg.r300 - 0.1 and not env_cut.pending

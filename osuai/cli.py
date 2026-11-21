@@ -491,6 +491,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         episode_seconds=args.episode_seconds,
         aim_shaping=args.aim_shaping,
         press_penalty=args.press_penalty,
+        pay_hits_on_time=args.pay_hits_on_time,
         hold_cost=args.hold_cost,
         r_spin=args.spin_reward,
         r_spin_bonus=args.spin_bonus,
@@ -834,6 +835,13 @@ def build_parser() -> argparse.ArgumentParser:
         "running (a positive number; 0 = off)",
     )
     # --reward-* are signed rewards (hits 0 or more, misses 0 or less); --*-penalty / --*-cost are positive amounts
+    p_tr.add_argument(
+        "--pay-hits-on-time",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pay an early hit when the object's time comes instead of on the press, so pressing early gains nothing "
+        "from the discount (on by default; --no-pay-hits-on-time pays on the press)",
+    )
     p_tr.add_argument("--reward-300", type=float, default=1.0, help="Reward for a 300 (circle, slider head or spinner)")
     p_tr.add_argument(
         "--reward-100", type=float, default=1.0 / 3.0,

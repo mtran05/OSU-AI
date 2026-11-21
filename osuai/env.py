@@ -68,6 +68,10 @@ class EnvConfig:
     hold_cost: float = 0.2
     # 100 and 50 are worth 1/3 and 1/6 of a 300, the weights of lazer's accuracy, so timing matters as much as it
     # does to the score: a press one tick late that drops a 300 to a 100 loses two thirds of the hit
+    # an early hit (before the object's time) is paid on the tick the object's time comes, not on the press: with
+    # gamma = 0.9 a reward one decision sooner is worth 10% more, so paying on the press makes pressing early pay in
+    # itself and pushes presses to the early edge of the 300 window, where some slip out and become 100s
+    pay_hits_on_time: bool = True
     r300: float = 1.0
     r100: float = 1.0 / 3.0
     r50: float = 1.0 / 6.0
@@ -278,6 +282,7 @@ class OsuEnv:
         self.slider_tracking = np.zeros(n, dtype=bool)
         self.spin_net = np.zeros(n, dtype=np.float64)  # signed rotation in radians
         self.spin_prev = np.full(n, np.nan, dtype=np.float64)
+        self.pending: list[tuple[float, float]] = []  # (map time it is paid at, reward) of early hits
         self.stats = PlayStats()
         self.key_down = False  # any key held
         self.key_down_before = False  # any key held during the previous tick (the state a movement into this tick starts from)
@@ -359,6 +364,8 @@ class OsuEnv:
         cfg = self.cfg
         self.stats.steps += 1
         truncated = (not terminal) and self.stats.steps >= self.max_steps
+        if truncated:
+            reward += self._pay_pending()  # an episode cut short still gets the hits it made
         if cfg.aim_shaping != 0.0:
             phi_next = 0.0 if terminal else self._potential()
             reward += cfg.aim_shaping * (cfg.gamma * phi_next - self.phi)
@@ -437,6 +444,7 @@ class OsuEnv:
             self.lo += 1
 
         terminal = self.lo >= md.n
+        reward += self._pay_pending(None if terminal else t1)  # early hits whose time has come (all, at the map's end)
 
         # Record this tick at its real time, before any fast-forward below moves the clock
         if self.record:
@@ -492,7 +500,19 @@ class OsuEnv:
             self._combo_hit()
         else:
             self.stats.combo = 0
-        return self._grade_reward(grade)
+        reward = self._grade_reward(grade)
+        if grade and dt < 0.0 and self.cfg.pay_hits_on_time:
+            self.pending.append((float(md.times[j]), reward))  # paid when the object's time comes
+            return 0.0
+        return reward
+
+    def _pay_pending(self, t1: float | None = None) -> float:
+        """Pay the early hits whose object time has come by t1 (all of them when t1 is None)."""
+        if not self.pending:
+            return 0.0
+        due = [r for t, r in self.pending if t1 is None or t <= t1]
+        self.pending = [(t, r) for t, r in self.pending if not (t1 is None or t <= t1)]
+        return float(sum(due))
 
     def _update_slider(self, j: int, t1: float) -> float:
         md = self.md
