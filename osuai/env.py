@@ -77,6 +77,12 @@ class EnvConfig:
     r_tail: float = 0.5  # slider end (150 points in lazer); a missed end gives nothing but breaks no combo
     r_spin: float = 0.5  # per rotation toward the spins a spinner's 300 needs, paid tick by tick as net rotation grows
     r_spin_bonus: float = 0.1  # per rotation beyond those
+    # forward rotation credited by the spin reward per tick (degrees; 0 = no cap, the default). Only the reward is capped:
+    # spins, grades and the judge count the full rotation, and turning back always costs in full. Off by default
+    # because it stops spinning from being learned: uncapped, random movement with a key held still earns a little
+    # (the net rotation drifts away from zero), which draws an untrained agent into spinning; capped, it loses
+    # reward on average, so the agent learns early on never to hold a key during spinners.
+    spin_max_deg: float = 0.0
     slider_break_penalty: float = 0.3  # a tracked slider lost before its end (key let go, or cursor out of the follow circle)
     slider_offset_cost: float = 1.0  # per second of a slider in progress at the follow circle's edge, linear in distance
 
@@ -545,9 +551,12 @@ class OsuEnv:
             # the move from the previous position to this one is made under the previous tick's keys
             if self.key_down_before and not math.isnan(prev) and t1 < md.ends[j]:
                 # signed: back-and-forth movement cancels out, as in lazer
-                before = self._spin_value(j)
+                before = abs(float(self.spin_net[j]))
                 self.spin_net[j] += (ang - prev + math.pi) % (2.0 * math.pi) - math.pi
-                reward += self._spin_value(j) - before  # paid as the net rotation grows; turning back costs it again
+                gain = abs(float(self.spin_net[j])) - before  # paid as the net rotation grows; turning back costs it again
+                if gain > 0.0 and self.cfg.spin_max_deg > 0.0:
+                    gain = min(gain, math.radians(self.cfg.spin_max_deg))
+                reward += self._spin_value_at(j, before + gain) - self._spin_value_at(j, before)
             self.spin_prev[j] = ang
         if t1 >= md.ends[j]:
             self.done[j] = True
@@ -562,9 +571,9 @@ class OsuEnv:
             reward += self._grade_reward(grade)
         return reward
 
-    def _spin_value(self, j: int) -> float:
-        """Reward earned so far on spinner j: r_spin per rotation up to the spins a 300 needs, r_spin_bonus after."""
-        spins = abs(float(self.spin_net[j])) / (2.0 * math.pi)
+    def _spin_value_at(self, j: int, rotation: float) -> float:
+        """Spin reward for `rotation` radians on spinner j: r_spin per rotation up to the spins a 300 needs, r_spin_bonus after."""
+        spins = rotation / (2.0 * math.pi)
         req = float(self.md.spins_required[j])
         return self.cfg.r_spin * min(spins, req) + self.cfg.r_spin_bonus * max(0.0, spins - req)
 

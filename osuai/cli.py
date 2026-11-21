@@ -472,6 +472,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         if value * sign < 0:
             kind = "a hit: pass 0 or more" if sign > 0 else "a miss: pass 0 or less (e.g. -0.1)"
             raise ValueError(f"{flag} is the reward for {kind}, got {value}")
+    if args.spin_max_deg < 0:
+        raise ValueError(f"--spin-max-deg must be 0 (no cap) or more, got {args.spin_max_deg}")
     if not args.reward_50 <= args.reward_100 <= args.reward_300:
         raise ValueError(
             f"Hit rewards must keep --reward-50 <= --reward-100 <= --reward-300, got "
@@ -492,6 +494,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         hold_cost=args.hold_cost,
         r_spin=args.spin_reward,
         r_spin_bonus=args.spin_bonus,
+        spin_max_deg=args.spin_max_deg,
         slider_break_penalty=args.slider_break_penalty,
         slider_offset_cost=args.slider_offset_cost,
         r300=args.reward_300,
@@ -849,6 +852,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reward per spinner rotation toward the spins its 300 needs, paid tick by tick as the net rotation grows",
     )
     p_tr.add_argument("--spin-bonus", type=float, default=0.1, help="Reward per spinner rotation beyond the spins its 300 needs")
+    p_tr.add_argument(
+        "--spin-max-deg", type=float, default=0.0,
+        help="Forward rotation the spin reward credits per tick, in degrees (default 0 = no cap; a cap makes random "
+        "spinning lose reward, so an untrained agent learns not to spin); spins and grades count it all",
+    )
     p_tr.add_argument(
         "--slider-break-penalty", type=float, default=0.3,
         help="Taken off the reward when a tracked slider is lost before its end: key let go or cursor out of the follow circle "
