@@ -908,3 +908,28 @@ def test_jumping_across_the_spinner_centre_spins_nothing():
     while not env.step_raw(256, 192, 0)[2]:
         pass
     assert judge_replay(bm, quantize_frames(env.frames)).spinner_spins_hit == 0
+
+
+def test_slider_ticks_are_decided_at_their_time_like_lazer():
+    """A tick between two ticks of the simulation is decided with the cursor partway between them and the keys of the
+    earlier one, as lazer plays a replay back: pressing again just after a tick does not earn it."""
+    from osuai.replay import quantize_frames
+
+    cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
+    # ticks at 2510 and 3010 ms; the early circle moves the start of play so the tick falls between two simulation
+    # ticks (if they coincide, the replay's whole-millisecond frame times put the new press exactly on the tick)
+    bm = parse_osu(_one_object_map("256,192,1000,1,0\n100,192,2010,2,0,L|400:192,1,300\n256,192,6000,1,0"))
+    obj = bm.objects[1]
+    tick = 2510.0
+    env = OsuEnv(MapData(bm, cfg), cfg, record=True)
+    env.reset(mode="full")
+    done = False
+    while not done and env.t < obj.end_time + 200:
+        t1 = env.t + cfg.dt_ms
+        b = obj.slider_pos_at_time(min(max(t1, obj.time), obj.end_time))
+        released = tick - 40 <= t1 < tick  # let go just before the tick; pressed again on the first tick after it
+        key = 0 if (t1 < obj.time - 8 or released) else KEY_K1
+        _, _, done, _ = env.step_raw(b.x, b.y, key)
+    assert env.stats.ticks_missed >= 1  # the key was still up at the tick's time
+    res = judge_replay(bm, quantize_frames(env.frames))
+    assert (env.stats.ticks_hit, env.stats.ends_hit) == (res.slider_ticks_hit, res.slider_ends_hit)

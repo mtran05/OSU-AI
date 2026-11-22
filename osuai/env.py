@@ -285,6 +285,7 @@ class OsuEnv:
         self.done = np.zeros(n, dtype=bool)
         self.tick_ptr = np.zeros(n, dtype=np.int32)
         self.slider_tracking = np.zeros(n, dtype=bool)
+        self.slider_seen = np.zeros(n, dtype=bool)  # updated at least once since its head was judged
         self.spin_net = np.zeros(n, dtype=np.float64)  # signed rotation in radians
         self.spin_prev = np.full(n, np.nan, dtype=np.float64)
         self.pending: list[tuple[float, float]] = []  # (map time it is paid at, reward) of early hits
@@ -394,6 +395,7 @@ class OsuEnv:
         self.key_down_before = self.key_down
         self.held_mask = mask
         self.key_down = mask != 0
+        self.prev_x, self.prev_y = self.x, self.y  # where the cursor was at the previous tick (replay frame)
         self.x = min(max(float(x), 0.0), PLAYFIELD_W)
         self.y = min(max(float(y), 0.0), PLAYFIELD_H)
         self.t = t1
@@ -553,8 +555,23 @@ class OsuEnv:
 
         ticks = md.ticks[j]
         p = int(self.tick_ptr[j])
+        seen = bool(self.slider_seen[j])
+        self.slider_seen[j] = True
         while p < len(ticks) and ticks[p] <= t1:  # ticks and repeats: decided at their time
-            if tracking:
+            tau = float(ticks[p])
+            hit = tracking
+            if seen and tau < t1:
+                # as lazer plays a replay back: between two frames the cursor moves in a straight line and the keys
+                # are still those of the earlier frame, so a tick inside this tick's interval is decided there, not
+                # with the new position and keys (on a slider's first update, a late head settles passed ticks)
+                t0 = t1 - cfg.dt_ms
+                u = min(max((tau - t0) / cfg.dt_ms, 0.0), 1.0)
+                cx = self.prev_x + (self.x - self.prev_x) * u
+                cy = self.prev_y + (self.y - self.prev_y) * u
+                b = obj.slider_pos_at_time(tau)
+                r = md.follow_radius if was_tracking else md.radius
+                hit = self.key_down_before and math.hypot(cx - b.x, cy - b.y) <= r
+            if hit:
                 self.stats.ticks_hit += 1
                 self._combo_hit()
                 reward += cfg.r_tick
