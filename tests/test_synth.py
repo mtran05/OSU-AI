@@ -77,6 +77,12 @@ def test_generate_command_writes_a_named_folder_and_merges_its_manifest(tmp_path
     assert out["maps_in_folder"] == 5
     entries = json.loads(Path("maps/drills/manifest.json").read_text(encoding="utf-8"))["maps"]
     assert all(Path(e["path"]).exists() and e["path"].startswith("maps/drills/") for e in entries)
+    # a map is found by the MD5 of its bytes, so the file name, the manifest and the parser must all agree
+    import hashlib
+
+    for e in entries:
+        real = hashlib.md5(Path(e["path"]).read_bytes()).hexdigest()
+        assert real == e["md5"] == Path(e["path"]).stem == parse_osu(Path(e["path"])).md5
     assert [e["star_rating"] for e in entries] == sorted((e["star_rating"] for e in entries), reverse=True)
     # --only picks the folder when --name is not given; mixed maps default to maps/synthetic
     out = run("--stars", "3", "--count", "1", "--only", "sliders", "--length", "20", "--seed", "20")

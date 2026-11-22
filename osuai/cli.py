@@ -155,7 +155,9 @@ def cmd_generate(args: argparse.Namespace) -> int:
         target = lo if args.count == 1 else lo + (hi - lo) * i / (args.count - 1)
         res = generate_map(target, ratio, length_s=args.length, seed=seed + i, tolerance=args.tolerance)
         dest = out_dir / f"{res.md5}.osu"
-        dest.write_text(res.text, encoding="utf-8")
+        # write the exact bytes res.md5 was computed from: write_text would turn "\n" into "\r\n" on Windows, and
+        # every reader identifies a map by the MD5 of its bytes, so the file name would no longer match
+        dest.write_bytes(res.text.encode("utf-8"))
         title = res.text.split("Title:", 1)[1].split("\n", 1)[0]
         entry = {
             "path": str(dest).replace("\\", "/"),
@@ -458,6 +460,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     for flag, value in (
         ("--press-penalty", args.press_penalty),
         ("--hold-cost", args.hold_cost),
+        ("--empty-press-cost", args.empty_press_cost),
         ("--slider-break-penalty", args.slider_break_penalty),
         ("--slider-offset-cost", args.slider_offset_cost),
     ):
@@ -493,6 +496,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         press_penalty=args.press_penalty,
         pay_hits_on_time=args.pay_hits_on_time,
         hold_cost=args.hold_cost,
+        empty_press_cost=args.empty_press_cost,
         r_spin=args.spin_reward,
         r_spin_bonus=args.spin_bonus,
         spin_max_deg=args.spin_max_deg,
@@ -828,6 +832,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument(
         "--press-penalty", type=float, default=0.03,
         help="Taken off the reward per key press, including switching K1 <-> K2 while holding (a positive number)",
+    )
+    p_tr.add_argument(
+        "--empty-press-cost", type=float, default=0.1,
+        help="Taken off the reward, on top of --press-penalty, for a press that hits nothing: no circle or slider head, "
+        "no slider in progress, no spinner running or about to start (a positive number; 0 = off)",
     )
     p_tr.add_argument(
         "--hold-cost", type=float, default=0.2,

@@ -818,3 +818,93 @@ def test_early_hits_are_paid_at_the_objects_time():
     assert env_end.stats.n300 == 1 and np.isclose(r_end[-1], cfg.r300 - cfg.press_penalty - hold_tick) and not env_end.pending
     _, r_cut, env_cut = run(True, 1975, cut_after_press=True)
     assert env_cut.stats.n300 == 1 and r_cut[-1] > cfg.r300 - 0.1 and not env_cut.pending
+
+
+def test_a_press_that_hits_nothing_costs_extra():
+    cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
+
+    def env_for(objs: str) -> OsuEnv:
+        env = OsuEnv(MapData(parse_osu(_one_object_map(objs)), cfg), cfg)
+        env.reset(mode="full")
+        return env
+
+    def until(env: OsuEnv, t: float, x: float, y: float, key: int = 0) -> None:
+        while env.t + cfg.dt_ms < t:
+            env.step_raw(x, y, key)
+
+    # a press in empty space: the press penalty plus the empty-press cost (plus one tick of idle holding)
+    env = env_for("256,192,4000,1,0")
+    until(env, 1000, 50, 50)
+    _, r, _, _ = env.step_raw(50, 50, KEY_K1)
+    assert env.stats.empty_presses == 1
+    assert np.isclose(r, -cfg.press_penalty - cfg.empty_press_cost - cfg.hold_cost * cfg.dt_ms / 1000.0)
+    # a press that hits a circle, or one far too early on it (a miss), judged something: no extra cost
+    for press_at in (4000 - 8, 4000 - 300):
+        env = env_for("256,192,4000,1,0\n256,192,6000,1,0")
+        until(env, press_at, 256, 192)
+        env.step_raw(256, 192, KEY_K1)
+        assert env.stats.empty_presses == 0 and env.stats.n300 + env.stats.n_miss == 1
+    # pressing again during a slider (to pick it back up) or a spinner, or just before a spinner, is not wasted
+    slider = "100,192,2000,2,0,L|400:192,1,300\n256,192,6000,1,0"
+    obj = parse_osu(_one_object_map(slider)).objects[0]
+    env = env_for(slider)
+    until(env, obj.time - 8, 100, 192)
+    t = obj.time - 8
+    while env.t + cfg.dt_ms < obj.time + 600:
+        t1 = env.t + cfg.dt_ms
+        b = obj.slider_pos_at_time(min(max(t1, obj.time), obj.end_time))
+        env.step_raw(b.x, b.y, 0 if obj.time + 300 <= t1 < obj.time + 340 else KEY_K1)  # let go for a moment
+    assert env.stats.empty_presses == 0 and env.stats.presses == 2
+    for press_at in (2000 - 50, 2500):
+        env = env_for("256,192,2000,8,0,5000\n256,192,8000,1,0")
+        until(env, press_at, 316, 192)
+        env.step_raw(316, 192, KEY_K1)
+        assert env.stats.empty_presses == 0
+
+
+def test_spinner_frames_show_its_area_rotation_and_progress():
+    cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
+    env = OsuEnv(MapData(parse_osu(_one_object_map("256,192,2000,8,0,5000\n256,192,8000,1,0")), cfg), cfg)
+    env.reset(mode="full")
+    while env.t + cfg.dt_ms < 2000:
+        env.step_raw(316, 192, 0)
+    s = cfg.render.scale
+
+    def px(frame, x, y):
+        return int(frame[int(y * s), int(x * s)])
+
+    before = env.step_raw(256, 100, 0)[0]
+    # the whole spinner area is filled, so a running spinner never looks like an empty screen
+    assert px(before, 256 + 120, 192) > 0 and px(before, 256 - 120, 192 + 40) > 0
+    # the line points up while nothing has been spun, and does not move while no key is held
+    up = px(before, 256, 192 - 120)
+    assert up > px(before, 256, 192 + 120) + 20
+    # spinning with a key held turns the line (a quarter turn clockwise on screen: it points right) and brightens the area
+    for a in np.linspace(-90, 0, 7):
+        frame = env.step_raw(256 + 80 * np.cos(np.radians(a)), 192 + 80 * np.sin(np.radians(a)), KEY_K1)[0]
+    assert np.isclose(env.spin_net[0], np.pi / 2, atol=0.05)
+    assert px(frame, 256 + 140, 192) > px(frame, 256, 192 - 140) + 20  # the line now points right
+    assert px(frame, 256 - 120, 192 + 40) > px(before, 256 - 120, 192 + 40)  # some progress: a brighter area
+
+
+def test_jumping_across_the_spinner_centre_spins_nothing():
+    """Cells come in pairs exactly opposite each other around the playfield centre, so a jump between them is exactly
+    180 degrees, which has no direction. Like lazer and the replay judge, the env keeps +180 and -180 as they are, so
+    jumping back and forth across the centre cancels out instead of counting as half a turn every jump."""
+    from osuai.replay import quantize_frames
+
+    cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
+    bm = parse_osu(_one_object_map("256,192,2000,8,0,5000\n256,192,8000,1,0"))
+    env = OsuEnv(MapData(bm, cfg), cfg, record=True)
+    env.reset(mode="full")
+    while env.t + cfg.dt_ms < 2000:
+        env.step_raw(267, 181, 0)
+    path = [(267, 181), (224, 224), (288, 160), (245, 203), (309, 139)]  # all on one line through (256, 192)
+    i = 0
+    while env.t + cfg.dt_ms < 5000:
+        env.step_raw(*path[(i // 2) % len(path)], KEY_K1)
+        i += 1
+    assert abs(env.spin_net[0]) < np.pi + 1e-6  # at most the half turn of a single unmatched jump
+    while not env.step_raw(256, 192, 0)[2]:
+        pass
+    assert judge_replay(bm, quantize_frames(env.frames)).spinner_spins_hit == 0

@@ -1,4 +1,4 @@
-"""Black-and-white playfield simulator.
+"""Grayscale playfield simulator.
 
 Renders what the osu! client would show on screen (approach circles, hit circles, slider bodies, slider ball,
 follow circle, spinners, cursor, key overlay) as a small grayscale image. This is the ONLY observation the DQN
@@ -6,8 +6,12 @@ agent receives: no object coordinates, timings or other game-state numbers are e
 
 Intensity conventions (0..1, stored as uint8 0..255). Every playfield element is drawn at <= 0.85 so the cursor
 (1.0) is always the brightest thing on screen:
-    slider body 0.20, hit circle fill 0.35, follow circle 0.50, slider border 0.55, spinner 0.60,
-    hit circle border 0.70, slider ball 0.75, approach circle 0.85, cursor 1.00
+    spinner area 0.12 (rising to 0.32 as the required spins are reached), slider body 0.20, hit circle fill 0.35,
+    follow circle 0.50, slider border 0.55, spinner ring / centre / rotation line 0.60, hit circle border 0.70,
+    slider ball 0.75, approach circle 0.85, cursor 1.00
+A spinner fills its whole area (so a running spinner never looks like an empty screen), shows a ring shrinking
+over its duration (time left), and a line from its centre that turns with the rotation that counts toward it, as
+lazer's spinner disc turns: it only moves while a key is held, so the frame shows whether spinning registers.
 A HUD strip under the playfield shows the K1 / K2 key overlay (lit while the key is held).
 """
 
@@ -31,6 +35,8 @@ I_CIRCLE_FILL = 0.35
 I_FOLLOW = 0.50
 I_SLIDER_BORDER = 0.55
 I_SPINNER = 0.60
+I_SPINNER_FILL = 0.12  # the spinner's area at the start
+I_SPINNER_FILL_DONE = 0.32  # ... once the spins a 300 needs are reached
 I_CIRCLE_BORDER = 0.70
 I_BALL = 0.75
 I_APPROACH = 0.85
@@ -127,6 +133,22 @@ class FrameRenderer:
         d = self._dist(bb, u, v)
         self._blend(canvas, bb, np.clip(self.ring_w * 0.5 + 0.5 - np.abs(d - r_px), 0.0, 1.0) * inten)
 
+    def _segment(self, canvas: np.ndarray, x0: float, y0: float, x1: float, y1: float, inten: float) -> None:
+        """An anti-aliased line of ring width from (x0, y0) to (x1, y1), in osu!px."""
+        (u0, v0), (u1, v1) = self._to_px(x0, y0), self._to_px(x1, y1)
+        reach = self.ring_w + 1.0
+        bx0 = max(int(math.floor(min(u0, u1) - reach)), 0)
+        bx1 = min(int(math.ceil(max(u0, u1) + reach)) + 1, self.fw)
+        by0 = max(int(math.floor(min(v0, v1) - reach)), 0)
+        by1 = min(int(math.ceil(max(v0, v1) + reach)) + 1, self.fh)
+        if bx0 >= bx1 or by0 >= by1 or inten <= 0.0:
+            return
+        gy, gx = np.mgrid[by0:by1, bx0:bx1].astype(np.float32)
+        du, dv = u1 - u0, v1 - v0
+        t = np.clip(((gx - u0) * du + (gy - v0) * dv) / max(du * du + dv * dv, 1e-9), 0.0, 1.0)
+        d = np.hypot(gx - (u0 + t * du), gy - (v0 + t * dv))
+        self._blend(canvas, (by0, by1, bx0, bx1), np.clip(self.ring_w * 0.5 + 0.5 - d, 0.0, 1.0) * inten)
+
     def _hit_circle(self, canvas: np.ndarray, x: float, y: float, inten: float) -> None:
         u, v = self._to_px(x, y)
         bb = self._bbox(u, v, self.r_px + self.ring_w + 1.0)
@@ -197,6 +219,8 @@ class FrameRenderer:
         visible: list[int],
         head_pending: np.ndarray,
         tracking_slider: int = -1,
+        spin_rotation: np.ndarray | None = None,
+        spins_required: np.ndarray | None = None,
     ) -> np.ndarray:
         """Render the frame at map time t.
 
@@ -204,6 +228,8 @@ class FrameRenderer:
         visible: indices of objects that are on screen (not yet finished) at time t.
         head_pending: per-object flag, True while a circle / slider head has not been judged yet.
         tracking_slider: index of the slider whose follow circle is shown (being tracked), or -1.
+        spin_rotation / spins_required: per-object counted spinner rotation (signed radians) and the full spins a
+            300 needs; they turn the spinner's line and brighten its area (no rotation when not given).
         """
         canvas = np.zeros((self.cfg.height, self.fw), dtype=np.float32)
         field = canvas[: self.fh]
@@ -219,9 +245,17 @@ class FrameRenderer:
                     frac = 0.0
                 else:
                     frac = min(max((t - o.time) / max(o.duration, 1.0), 0.0), 1.0)
+                rot = float(spin_rotation[i]) if spin_rotation is not None else 0.0
+                req = float(spins_required[i]) if spins_required is not None else 0.0
+                progress = 1.0 if req <= 0.0 and rot != 0.0 else min(abs(rot) / (2.0 * math.pi) / max(req, 1e-9), 1.0)
+                fill = I_SPINNER_FILL + (I_SPINNER_FILL_DONE - I_SPINNER_FILL) * progress
+                self._disc(field, o.pos.x, o.pos.y, SPINNER_MAX_R * self.s, fill * alpha)  # the whole spinner area
                 r = (SPINNER_MAX_R - (SPINNER_MAX_R - SPINNER_MIN_R) * frac) * self.s
-                self._ring(field, o.pos.x, o.pos.y, r, I_SPINNER * alpha)
+                self._ring(field, o.pos.x, o.pos.y, r, I_SPINNER * alpha)  # time left
                 self._disc(field, o.pos.x, o.pos.y, max(1.0, 4.0 * self.s), I_SPINNER * alpha)
+                ang = rot - math.pi / 2.0  # starts pointing up, turns with the counted rotation (osu! y points down)
+                self._segment(field, o.pos.x, o.pos.y, o.pos.x + SPINNER_MAX_R * math.cos(ang),
+                              o.pos.y + SPINNER_MAX_R * math.sin(ang), I_SPINNER * alpha)
                 continue
 
             if o.kind == "slider":
