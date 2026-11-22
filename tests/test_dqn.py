@@ -328,6 +328,8 @@ def test_train_save_load_and_play(tmp_path: Path):
     assert set(again.all_train_maps) >= set(agent.all_train_maps) and set(again.all_val_maps) >= set(agent.all_val_maps)
     assert [h["round"] for h in again.history] == [1, 2] and again.history[1]["max_stars"] == 5.0
     for k, v in agent.net.state_dict().items():
+        if k.endswith("._u") or k.endswith("._v"):
+            continue  # spectral norm's power-iteration estimates are refined by every forward pass while acting
         assert torch.equal(v, again.net.state_dict()[k]), k
     assert (round1 / "best.pt").exists()  # earlier rounds are left untouched
 

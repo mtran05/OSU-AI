@@ -1,8 +1,12 @@
-"""Deep Q-Network agent that learns osu! from simulated grayscale frames.
+"""Beyond The Rainbow (BTR, Clark et al. 2024) agent that learns osu! from simulated grayscale frames.
 
-Kept from DeepMind's DQN (Mnih et al. 2015): the observation is the last 4 rendered frames, experience replay,
-a periodically synced target network, epsilon-greedy exploration, Huber loss, and action repeat (the env decides
-every few ticks). Plus Double DQN targets and n-step returns.
+From DeepMind's DQN (Mnih et al. 2015): the observation is the last 4 rendered frames, experience replay, a
+periodically synced target network and action repeat (the env decides every few ticks). From Rainbow (Hessel et al.
+2018): n-step returns, a dueling value/advantage split, prioritized replay (Schaul et al. 2016) and noisy layers for
+exploration (Fortunato et al. 2018). BTR's additions: an IMPALA residual encoder with spectral normalization, an
+implicit quantile head (IQN, Dabney et al. 2018) in place of C51, and Munchausen targets (Vieillard et al. 2020) in
+place of Double DQN. Each part can be switched off for comparison; with all of them off it is a plain DQN with a
+Huber loss and epsilon-greedy exploration, which is how checkpoints from before BTR are loaded.
 
 The action space is *spatial*, like DeepMind's StarCraft II agents: the network is fully convolutional and
 outputs one Q-value per (screen cell, key state) pair, i.e. "aim here, holding no key / K1 / K2". Two keys let
@@ -12,6 +16,7 @@ convolutional network, which is good at finding where something is in an image.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import time
@@ -42,13 +47,91 @@ ROUND_FILE = "round.json"
 
 
 # ---------------------------------------------------------------------------------------------- network
+class NoisyLayer(nn.Module):
+    """A fully connected layer with learned, factorised Gaussian noise on its weights (Fortunato et al. 2018).
+
+    Applied to (B, in) it is a linear layer; applied to (B, in, H, W) it is a 1x1 convolution, the same layer at every
+    cell. While training, the weights are mu + sigma * noise, with the noise redrawn by reset_noise(); in eval mode
+    only mu is used, so greedy play is deterministic. The agent explores by learning how much noise each weight keeps.
+    """
+
+    def __init__(self, n_in: int, n_out: int, sigma0: float = 0.5) -> None:
+        super().__init__()
+        self.n_in, self.n_out = n_in, n_out
+        bound = 1.0 / math.sqrt(n_in)
+        self.weight_mu = nn.Parameter(torch.empty(n_out, n_in).uniform_(-bound, bound))
+        self.weight_sigma = nn.Parameter(torch.full((n_out, n_in), sigma0 / math.sqrt(n_in)))
+        self.bias_mu = nn.Parameter(torch.empty(n_out).uniform_(-bound, bound))
+        self.bias_sigma = nn.Parameter(torch.full((n_out,), sigma0 / math.sqrt(n_in)))
+        self.register_buffer("eps_in", torch.zeros(n_in), persistent=False)
+        self.register_buffer("eps_out", torch.zeros(n_out), persistent=False)
+        self.reset_noise()
+
+    @staticmethod
+    def _f(x: torch.Tensor) -> torch.Tensor:
+        return x.sign() * x.abs().sqrt()
+
+    def reset_noise(self) -> None:
+        self.eps_in.copy_(self._f(torch.randn(self.n_in, device=self.eps_in.device)))
+        self.eps_out.copy_(self._f(torch.randn(self.n_out, device=self.eps_out.device)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            w = self.weight_mu + self.weight_sigma * torch.outer(self.eps_out, self.eps_in)
+            b = self.bias_mu + self.bias_sigma * self.eps_out
+        else:
+            w, b = self.weight_mu, self.bias_mu
+        if x.dim() == 4:
+            return F.conv2d(x, w[:, :, None, None], b)
+        return F.linear(x, w, b)
+
+
+def _head_precision(device: torch.device):
+    """Turn mixed precision off for the network's head. bf16 keeps about 3 significant digits (steps of about 0.008
+    near 1.0), so action values computed in it would round close calls such as pressing now or a tick later, and the
+    greedy choice between them; the head is a small share of the work, so float32 there costs almost nothing."""
+    return torch.autocast(device_type=device.type, enabled=False)
+
+
+class ResBlock(nn.Module):
+    """IMPALA residual unit, x + conv(relu(conv(relu(x)))), optionally dilated and with spectral normalization on both
+    convolutions (as BTR does), which keeps each layer from amplifying its input and steadies learning."""
+
+    def __init__(self, c: int, dilation: int = 1, spectral: bool = True) -> None:
+        super().__init__()
+        sn = nn.utils.parametrizations.spectral_norm if spectral else (lambda m: m)
+        self.c1 = sn(nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation))
+        self.c2 = sn(nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.c2(F.relu(self.c1(F.relu(x))))
+
+
+def _impala_stage(c_in: int, c_out: int, spectral: bool) -> nn.Sequential:
+    """conv 3x3, max-pool 3x3 stride 2 (half the size), two residual units."""
+    return nn.Sequential(
+        nn.Conv2d(c_in, c_out, 3, padding=1), nn.MaxPool2d(3, stride=2, padding=1),
+        ResBlock(c_out, 1, spectral), ResBlock(c_out, 1, spectral),
+    )
+
+
 class QNetwork(nn.Module):
     """Fully convolutional spatial Q-network.
 
-    Input: (B, frames, H, W) uint8 frames (playfield rows on top, HUD rows below). Output: (B, grid_h*grid_w*n_keys)
-    Q-values, index = (row * grid_w + col) * n_keys + key, matching the env's action table. Two constant
-    coordinate channels (CoordConv) are appended so cells near the edges can be told apart. A globally pooled
-    summary is broadcast back onto every cell so each cell's value can also depend on the whole screen.
+    Input: (B, frames, H, W) uint8 frames (playfield rows on top, HUD rows below). Output of forward() / q_values():
+    (B, grid_h*grid_w*n_keys) expected returns, index = (row * grid_w + col) * n_keys + key, matching the env's action
+    table. Two constant coordinate channels (CoordConv) are appended so cells near the edges can be told apart.
+
+    Encoder: "impala" (BTR): two IMPALA stages (conv, max-pool to half size, two residual units; channels//2 then
+    channels), then `depth` residual units whose spacing doubles (1, 2, 4, ...) so each cell sees further, with
+    spectral normalization in every residual unit. "conv": the original plain network (two strided convolutions and
+    `depth` dilated convolutions), kept so older checkpoints load. Unlike BTR, the features are not max-pooled to 6x6
+    for a fully connected head: every aim cell keeps its own output, which is what makes the action space spatial.
+
+    Head: a globally pooled summary of the screen is broadcast onto every cell. With quantiles > 0 the head is IQN
+    (Dabney et al. 2018, as in BTR): it outputs return quantiles for sampled levels tau in (0, 1), each tau's cosine
+    embedding scaling the head's hidden features. Dueling adds a value stream from the pooled summary to the cells'
+    advantages minus their mean. Noisy layers replace the head's layers when noisy is set.
     """
 
     def __init__(
@@ -61,6 +144,12 @@ class QNetwork(nn.Module):
         dueling: bool = False,
         channels: int = 64,
         depth: int = 3,
+        quantiles: int = 0,
+        noisy: bool = False,
+        noisy_sigma: float = 0.5,
+        encoder: str = "conv",
+        spectral_norm: bool = False,
+        n_cos: int = 64,
     ) -> None:
         super().__init__()
         self.in_frames = in_frames
@@ -69,28 +158,45 @@ class QNetwork(nn.Module):
         self.grid_hw = tuple(grid_hw)
         self.n_keys = n_keys
         self.dueling = dueling
+        self.channels, self.depth = int(channels), int(depth)
+        self.quantiles, self.noisy, self.encoder, self.n_cos = int(quantiles), bool(noisy), encoder, int(n_cos)
         h, w = obs_hw
         ys = torch.linspace(-1.0, 1.0, h).view(1, 1, h, 1).expand(1, 1, h, w)
         xs = torch.linspace(-1.0, 1.0, w).view(1, 1, 1, w).expand(1, 1, h, w)
         self.register_buffer("coords", torch.cat([xs, ys], dim=1).contiguous(), persistent=False)
-        self.channels, self.depth = int(channels), int(depth)
         c, c0 = self.channels, max(1, self.channels // 2)
-        # two downsampling layers, then `depth` layers at the same size whose spacing doubles (1, 2, 4, 8, ...), so each
-        # one reaches twice as far: with depth 3 a cell sees about 64 frame pixels around it
-        layers: list[nn.Module] = [
-            nn.Conv2d(in_frames + 2, c0, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(c0, c, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-        ]
-        for k in range(self.depth):
-            d = 2**k
-            layers += [nn.Conv2d(c, c, kernel_size=3, padding=d, dilation=d), nn.ReLU(inplace=True)]
-        self.torso = nn.Sequential(*layers)
+        if encoder == "impala":
+            self.torso = nn.Sequential(
+                _impala_stage(in_frames + 2, c0, spectral_norm), _impala_stage(c0, c, spectral_norm),
+                *[ResBlock(c, 2**k, spectral_norm) for k in range(self.depth)], nn.ReLU(),
+            )
+        elif encoder == "conv":
+            # two downsampling layers, then `depth` layers at the same size whose spacing doubles (1, 2, 4, 8, ...)
+            layers: list[nn.Module] = [
+                nn.Conv2d(in_frames + 2, c0, kernel_size=4, stride=2, padding=1), nn.ReLU(inplace=True),
+                nn.Conv2d(c0, c, kernel_size=3, stride=2, padding=1), nn.ReLU(inplace=True),
+            ]
+            for k in range(self.depth):
+                d = 2**k
+                layers += [nn.Conv2d(c, c, kernel_size=3, padding=d, dilation=d), nn.ReLU(inplace=True)]
+            self.torso = nn.Sequential(*layers)
+        else:
+            raise ValueError(f"Unknown encoder {encoder!r} (use 'impala' or 'conv')")
         self.context = nn.Sequential(nn.Linear(c, c), nn.ReLU(inplace=True))
-        self.head = nn.Sequential(nn.Conv2d(2 * c, c, kernel_size=1), nn.ReLU(inplace=True), nn.Conv2d(c, n_keys, 1))
+
+        def layer(n_in: int, n_out: int, conv: bool) -> nn.Module:
+            if self.noisy:
+                return NoisyLayer(n_in, n_out, noisy_sigma)
+            return nn.Conv2d(n_in, n_out, 1) if conv else nn.Linear(n_in, n_out)
+
+        # head: hidden layer, then the output layer (the names are those of the original network for old checkpoints)
+        self.head = nn.Sequential(layer(2 * c, c, True), nn.ReLU(inplace=True), layer(c, n_keys, True))
         if dueling:
-            self.value = nn.Sequential(nn.Linear(c, c), nn.ReLU(inplace=True), nn.Linear(c, 1))
+            self.value = nn.Sequential(layer(c, c, False), nn.ReLU(inplace=True), layer(c, 1, False))
+        if self.quantiles > 0:
+            # tau -> cos(pi * i * tau), i = 0..n_cos-1 -> one scale per hidden feature, for the cells and for the value
+            self.register_buffer("cos_i", torch.arange(self.n_cos, dtype=torch.float32) * math.pi, persistent=False)
+            self.tau_embed = nn.Sequential(nn.Linear(self.n_cos, 2 * c), nn.ReLU(inplace=True))
 
     @property
     def n_actions(self) -> int:
@@ -103,42 +209,128 @@ class QNetwork(nn.Module):
         A finer grid would only repeat feature cells, so neighbouring cells would share the same Q-values.
         """
 
-        def torso(n: int) -> int:  # the two stride-2 convolutions; the dilated ones keep the size
-            n = (n + 2 - 4) // 2 + 1
+        def torso(n: int) -> int:  # two halvings (strided conv or max-pool, 3x3 stride 2 padding 1 sizes)
+            n = (n + 2 - 3) // 2 + 1
             return (n + 2 - 3) // 2 + 1
 
         fh, fw = torso(obs_hw[0]), torso(obs_hw[1])
         return (max(1, round(field_h * fh / obs_hw[0])), fw)
 
-    def forward(self, obs_u8: torch.Tensor) -> torch.Tensor:
+    def _features(self, obs_u8: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-cell hidden features (B, c, grid_h, grid_w) and the pooled screen summary (B, c)."""
         x = obs_u8.float() * (1.0 / 255.0)
         x = torch.cat([x, self.coords.expand(x.shape[0], -1, -1, -1)], dim=1)
-        f = self.torso(x)
-        pooled = f.mean(dim=(2, 3))
-        ctx = self.context(pooled)[:, :, None, None].expand_as(f)
-        q = self.head(torch.cat([f, ctx], dim=1))  # (B, n_keys, h', w')
-        # keep only the feature rows that cover the playfield (drop the HUD strip), then fit them to the grid
-        rows = max(1, round(self.field_h * f.shape[2] / self.obs_hw[0]))
-        q = F.adaptive_avg_pool2d(q[:, :, :rows], self.grid_hw)
-        q = q.permute(0, 2, 3, 1).reshape(q.shape[0], -1)  # (B, grid_h * grid_w * n_keys)
+        f = self.torso(x)  # under mixed precision: bf16, where nearly all the computation is
+        # everything after the encoder stays float32 (see _head_precision)
+        with _head_precision(f.device):
+            f = f.float()
+            pooled = f.mean(dim=(2, 3))
+            ctx = self.context(pooled)[:, :, None, None].expand_as(f)
+            hid = F.relu(self.head[0](torch.cat([f, ctx], dim=1)))
+            # keep only the feature rows that cover the playfield (drop the HUD strip), then fit them to the grid
+            rows = max(1, round(self.field_h * f.shape[2] / self.obs_hw[0]))
+            return F.adaptive_avg_pool2d(hid[:, :, :rows], self.grid_hw), pooled
+
+    def sample_taus(self, batch: int, n: int, device) -> torch.Tensor:
+        """n quantile levels per state: random in training, evenly spaced in eval mode (so greedy play is fixed)."""
+        if self.training:
+            return torch.rand(batch, n, device=device)
+        return ((torch.arange(n, device=device, dtype=torch.float32) + 0.5) / n).expand(batch, n)
+
+    def quantile_values(self, obs_u8: torch.Tensor, taus: torch.Tensor | None = None) -> torch.Tensor:
+        """(B, N, n_actions) returns at the quantile levels `taus` (B, N); N = 1 and taus unused without IQN."""
+        hid, pooled = self._features(obs_u8)
+        with _head_precision(hid.device):
+            return self._head(hid, pooled, taus)
+
+    def _head(self, hid: torch.Tensor, pooled: torch.Tensor, taus: torch.Tensor | None) -> torch.Tensor:
+        b, c, gh, gw = hid.shape
+        if self.quantiles > 0:
+            if taus is None:
+                taus = self.sample_taus(b, self.quantiles, hid.device)
+            emb = self.tau_embed(torch.cos(taus[..., None] * self.cos_i))  # (B, N, 2c)
+            e_cell, e_val = emb[..., :c], emb[..., c:]
+            n = taus.shape[1]
+            hid = (hid[:, None] * e_cell[..., None, None]).reshape(b * n, c, gh, gw)
+        else:
+            n = 1
+        adv = self.head[2](hid)  # (B*N, n_keys, gh, gw)
+        q = adv.view(b, n, self.n_keys, gh, gw).permute(0, 1, 3, 4, 2).reshape(b, n, gh * gw * self.n_keys)
         if self.dueling:
-            q = self.value(pooled) + q - q.mean(dim=1, keepdim=True)
+            v = F.relu(self.value[0](pooled))  # (B, c)
+            v = v[:, None] * e_val if self.quantiles > 0 else v[:, None]
+            q = self.value[2](v) + q - q.mean(dim=2, keepdim=True)  # (B, N, 1) + (B, N, A)
         return q
 
+    def q_values(self, obs_u8: torch.Tensor) -> torch.Tensor:
+        """(B, n_actions) expected returns: the mean over quantile levels (the single value without IQN)."""
+        return self.quantile_values(obs_u8).mean(dim=1)
+
+    def forward(self, obs_u8: torch.Tensor) -> torch.Tensor:
+        return self.q_values(obs_u8)
+
     def greedy(self, obs_u8: torch.Tensor) -> torch.Tensor:
-        return self(obs_u8).argmax(dim=1)
+        return self.q_values(obs_u8).argmax(dim=1)
+
+    def reset_noise(self) -> None:
+        for m in self.modules():
+            if isinstance(m, NoisyLayer):
+                m.reset_noise()
 
 
 # ---------------------------------------------------------------------------------------------- replay
+class SumTree:
+    """Leaf values in a binary tree of sums: set values and draw indices in proportion to them in O(log n)."""
+
+    def __init__(self, n: int) -> None:
+        self.P = 1 << max(1, (n - 1).bit_length())
+        self.tree = np.zeros(2 * self.P, dtype=np.float64)
+
+    @property
+    def total(self) -> float:
+        return float(self.tree[1])
+
+    def get(self, idx: np.ndarray) -> np.ndarray:
+        return self.tree[self.P + np.asarray(idx)]
+
+    def set(self, idx, values) -> None:
+        i = self.P + np.atleast_1d(np.asarray(idx, dtype=np.int64))
+        self.tree[i] = np.atleast_1d(np.asarray(values, dtype=np.float64))
+        i = np.unique(i // 2)
+        while i[0] >= 1:
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+            i = np.unique(i // 2)
+            if i[0] == 0:
+                break
+
+    def find(self, values: np.ndarray) -> np.ndarray:
+        """Leaf index for each value in [0, total): leaves are laid end to end by size."""
+        v = np.asarray(values, dtype=np.float64).copy()
+        idx = np.ones(len(v), dtype=np.int64)
+        while idx[0] < self.P:
+            left = self.tree[2 * idx]
+            right = v >= left
+            v = np.where(right, v - left, v)
+            idx = 2 * idx + right
+        return idx - self.P
+
+
 class ReplayBuffer:
     """Frame-efficient replay for several parallel envs.
 
     Each env owns a ring of single frames; stacked observations and n-step returns are rebuilt at sample time,
     so a transition costs one frame of memory instead of eight. Frame k of an env's ring is the observation on
     which action[k] was taken; `has_action[k]` is False for the last frame of an episode (no action from it).
+
+    With alpha > 0 the replay is prioritized (Schaul et al. 2016): a transition is drawn in proportion to
+    priority ** alpha, new ones at the highest priority seen so far, and sample() returns importance weights
+    ((N * P) ** -beta, scaled to at most 1) that undo the bias of not sampling uniformly. update_priorities() sets a
+    sampled transition's priority to its latest error. alpha = 0 is uniform replay with weights of 1.
     """
 
-    def __init__(self, n_envs: int, capacity: int, obs_hw: tuple[int, int], stack: int, n_step: int, gamma: float) -> None:
+    def __init__(
+        self, n_envs: int, capacity: int, obs_hw: tuple[int, int], stack: int, n_step: int, gamma: float, alpha: float = 0.0,
+    ) -> None:
         self.E = n_envs
         self.C = max(capacity // n_envs, stack + n_step + 2)
         self.stack = stack
@@ -152,6 +344,9 @@ class ReplayBuffer:
         self.has_action = np.zeros((n_envs, self.C), dtype=bool)
         self.ep_start = np.zeros((n_envs, self.C), dtype=bool)
         self.written = np.zeros(n_envs, dtype=np.int64)  # absolute number of frames written per env
+        self.alpha = float(alpha)
+        self.tree = SumTree(n_envs * self.C) if self.alpha > 0 else None
+        self.max_priority = 1.0
 
     def __len__(self) -> int:
         return int(np.minimum(self.written, self.C).sum())
@@ -159,6 +354,8 @@ class ReplayBuffer:
     def _put_frame(self, e: int, frame: np.ndarray, start: bool) -> None:
         k = int(self.written[e] % self.C)
         self.frames[e, k] = frame
+        if self.tree is not None and self.has_action[e, k]:
+            self.tree.set(e * self.C + k, 0.0)  # the transition stored in this slot is overwritten
         self.has_action[e, k] = False
         self.done[e, k] = False
         self.reward[e, k] = 0.0
@@ -174,7 +371,16 @@ class ReplayBuffer:
         self.reward[e, k] = reward
         self.done[e, k] = terminal
         self.has_action[e, k] = True
+        if self.tree is not None:
+            self.tree.set(e * self.C + k, self.max_priority**self.alpha)  # new transitions are seen at least once
         self._put_frame(e, next_frame, start=False)
+
+    def update_priorities(self, index: np.ndarray, errors: np.ndarray, eps: float = 1e-6) -> None:
+        if self.tree is None:
+            return
+        p = np.abs(np.asarray(errors, dtype=np.float64)) + eps
+        self.max_priority = max(self.max_priority, float(p.max()))
+        self.tree.set(index, p**self.alpha)
 
     def _stack(self, e: np.ndarray, idx: np.ndarray) -> np.ndarray:
         cols = [idx]
@@ -186,13 +392,43 @@ class ReplayBuffer:
         order = np.stack(cols[::-1], axis=1) % self.C  # (B, stack) oldest -> newest
         return self.frames[e[:, None], order]
 
-    def sample(self, batch: int, rng: np.random.Generator) -> dict[str, np.ndarray]:
+    def _sample_prioritized(self, batch: int, rng: np.random.Generator, lo: np.ndarray, hi: np.ndarray, beta: float):
+        """Draw transitions in proportion to their priority (one per equal slice of the total, as in the paper)."""
+        es: list[np.ndarray] = []
+        ids: list[np.ndarray] = []
+        gs: list[np.ndarray] = []
+        need = batch
+        total = self.tree.total
+        for _ in range(64):
+            u = (np.arange(need) + rng.random(need)) * (total / need)
+            g = self.tree.find(np.minimum(u, np.nextafter(total, 0)))
+            g = g[g < self.E * self.C]  # the tree is padded to a power of two; padding leaves are empty
+            e, k = g // self.C, g % self.C
+            w = self.written[e] - 1  # newest absolute frame of that env; slot k holds absolute index a
+            a = w - ((w - k) % self.C)
+            keep = self.has_action[e, k] & (a >= lo[e]) & (a <= hi[e]) & (self.tree.get(g) > 0)
+            es.append(e[keep])
+            ids.append(a[keep])
+            gs.append(g[keep])
+            need -= int(keep.sum())
+            if need <= 0:
+                break
+        e, a, g = np.concatenate(es)[:batch], np.concatenate(ids)[:batch], np.concatenate(gs)[:batch]
+        n_valid = max(int(np.count_nonzero(self.has_action)), 1)
+        probs = self.tree.get(g) / max(total, 1e-12)
+        weights = (n_valid * probs) ** (-beta)
+        return e, a, g, (weights / weights.max()).astype(np.float32)
+
+    def sample(self, batch: int, rng: np.random.Generator, beta: float = 0.4) -> dict[str, np.ndarray]:
         # Once a ring has wrapped, the oldest stack-1 frames may be missing their history
         lo = np.where(self.written > self.C, self.written - self.C + self.stack - 1, 0)
         hi = self.written - 2  # newest frame with a successor frame
         ok_env = np.nonzero(hi >= lo)[0]
         if len(ok_env) == 0:
             raise RuntimeError("Replay buffer does not have enough data to sample")
+        if self.tree is not None and self.tree.total > 0:
+            e, a, g, weights = self._sample_prioritized(batch, rng, lo, hi, beta)
+            return self._assemble(e, a, g, weights)
         es: list[np.ndarray] = []
         ids: list[np.ndarray] = []
         need = batch
@@ -207,7 +443,9 @@ class ReplayBuffer:
                 break
         e = np.concatenate(es)[:batch]
         a = np.concatenate(ids)[:batch]
+        return self._assemble(e, a, e * self.C + a % self.C, np.ones(len(a), dtype=np.float32))
 
+    def _assemble(self, e: np.ndarray, a: np.ndarray, g: np.ndarray, weights: np.ndarray) -> dict[str, np.ndarray]:
         ret = np.zeros(len(a), dtype=np.float32)
         disc = np.ones(len(a), dtype=np.float32)
         alive = np.ones(len(a), dtype=bool)
@@ -229,6 +467,8 @@ class ReplayBuffer:
             "ret": ret,
             "disc": np.where(term, 0.0, disc).astype(np.float32),
             "next_obs": self._stack(e, boot),
+            "index": g,  # for update_priorities
+            "weight": weights,
         }
 
 
@@ -239,20 +479,35 @@ class DQNConfig:
     n_envs: int = 8
     frame_stack: int = 4
     buffer_size: int = 300_000
-    batch_size: int = 64
+    batch_size: int = 256
     lr: float = 1e-4
-    adam_eps: float = 1.5e-4
+    adam_eps: float = 0.005 / 256  # BTR: 0.005 / batch size
     gamma: float = 0.9  # short horizon: at 30 decisions/s this looks ~1/3 s ahead, enough to aim and press
     n_step: int = 3
-    double: bool = True
-    dueling: bool = False
-    channels: int = 64  # network width (round 1 only; the first layer has half as many)
-    depth: int = 3  # layers after the two downsampling ones, each reaching twice as far (round 1 only)
+    double: bool = False  # Double DQN targets; BTR drops them, Munchausen targets replace them
+    dueling: bool = True  # value + advantage streams (round 1 only)
+    channels: int = 64  # network width (round 1 only; the first stage has half as many)
+    depth: int = 3  # units after the two downsampling stages, each reaching twice as far (round 1 only)
+    encoder: str = "impala"  # "impala" (BTR's residual encoder) or "conv" (the original plain one); round 1 only
+    spectral_norm: bool = True  # in the residual units (round 1 only)
+    quantiles: int = 8  # IQN quantile levels sampled per state (0: one value per action); round 1 only
+    n_cos: int = 64  # cosine features of a quantile level
+    kappa: float = 1.0  # quantile Huber loss threshold
+    munchausen: bool = True  # Munchausen targets (alpha * clipped scaled log-policy bonus, soft next-state value)
+    m_alpha: float = 0.9
+    m_tau: float = 0.03  # softmax temperature of the implied policy
+    m_l0: float = -1.0  # lower clip of the log-policy bonus
+    noisy: bool = True  # round 1 only
+    noisy_sigma: float = 0.5
+    per_alpha: float = 0.2  # prioritized replay strength (0: uniform)
+    per_beta: float = 0.4  # importance-weight correction, rising to 1 over each round
     learning_starts: int = 20_000
-    replay_ratio: float = 0.5  # gradient updates per environment transition (Atari DQN: 1 per 4 frames)
-    target_update: int = 2_000  # gradient updates between target-network syncs
-    eps_start: float = 1.0
-    eps_end: float = 0.05
+    # gradient updates per environment transition: one batch of 256 every 32 decisions, 8 replayed samples per decision
+    # (BTR: 256 every 64, 4 per decision); keeps a 2M-decision round at about 3 hours with the residual encoder
+    replay_ratio: float = 1 / 32
+    target_update: int = 500  # gradient updates between target-network syncs
+    eps_start: float = 1.0  # with noisy layers, a short random phase only (it presses keys rarely, see key_explore_prob)
+    eps_end: float = 0.0  # 0.05 without noisy layers
     eps_decay_steps: int = 250_000
     key_explore_prob: float = 0.2  # a random key action holds the key down this often (osu! punishes spam)
     grad_clip: float = 10.0
@@ -268,7 +523,57 @@ class DQNConfig:
     @classmethod
     def from_dict(cls, d: dict) -> DQNConfig:
         known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in d.items() if k in known})
+        # checkpoints from before BTR have none of its settings: they are plain DQN with the original encoder
+        legacy = {"encoder": "conv", "spectral_norm": False, "quantiles": 0, "munchausen": False, "noisy": False,
+                  "per_alpha": 0.0} if "encoder" not in d else {}
+        return cls(**{**legacy, **{k: v for k, v in d.items() if k in known}})
+
+
+def td_loss(
+    online: QNetwork, target: QNetwork, obs: torch.Tensor, act: torch.Tensor, ret: torch.Tensor, disc: torch.Tensor,
+    nxt: torch.Tensor, cfg: DQNConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-sample loss (with gradient), per-sample priority and the taken actions' current values for one batch.
+
+    ret is the n-step discounted reward and disc = gamma**n (0 after a terminal). The target network is in eval mode
+    (no noise). Munchausen (Vieillard et al. 2020), as in BTR: the target adds alpha * clip(tau * log pi(a_t|s_t), l0, 0)
+    with pi = softmax(q_target / tau), and bootstraps the soft value sum_a pi(a|s')(z(s', a) - tau log pi(a|s')) instead
+    of a max. Without it, a max (or the Double DQN choice) as usual. With IQN the online and target quantiles are
+    compared with the quantile Huber loss (summed over online levels, averaged over target levels).
+    """
+    b = act.shape[0]
+    rows = torch.arange(b, device=act.device)
+    n = max(cfg.quantiles, 1)
+    iqn = online.quantiles > 0
+    if iqn:
+        taus = torch.rand(b, n, device=obs.device)
+        z = online.quantile_values(obs, taus).float()  # (B, N, A)
+        z_sel = z.gather(2, act[:, None, None].expand(b, n, 1)).squeeze(2)  # (B, N)
+    else:
+        z_sel = online.quantile_values(obs).float().gather(2, act[:, None, None].expand(b, 1, 1)).squeeze(2)  # (B, 1)
+    with torch.no_grad():
+        z_next = target.quantile_values(nxt, torch.rand(b, n, device=obs.device) if iqn else None).float()  # (B, N', A)
+        q_next = z_next.mean(dim=1)  # (B, A)
+        if cfg.munchausen:
+            t, alpha = cfg.m_tau, cfg.m_alpha
+            logpi_next = F.log_softmax(q_next / t, dim=1)
+            soft_next = (logpi_next.exp()[:, None, :] * (z_next - t * logpi_next[:, None, :])).sum(dim=2)  # (B, N')
+            logpi_cur = F.log_softmax(target.q_values(obs).float() / t, dim=1)[rows, act]
+            bonus = alpha * (t * logpi_cur).clamp(cfg.m_l0, 0.0)
+            y = ret[:, None] + bonus[:, None] + disc[:, None] * soft_next  # (B, N')
+        else:
+            a_star = (online.q_values(nxt).float() if cfg.double else q_next).argmax(dim=1)
+            y = ret[:, None] + disc[:, None] * z_next.gather(2, a_star[:, None, None].expand(b, z_next.shape[1], 1)).squeeze(2)
+    delta = y[:, None, :] - z_sel[:, :, None]  # (B, N online, N' target)
+    huber = F.smooth_l1_loss(z_sel[:, :, None].expand_as(delta), y[:, None, :].expand_as(delta), reduction="none",
+                             beta=cfg.kappa)  # Huber(delta) / kappa
+    if iqn:
+        weight = (taus[:, :, None] - (delta.detach() < 0).float()).abs()
+        per_sample = (weight * huber).sum(dim=1).mean(dim=1)
+    else:
+        per_sample = huber.mean(dim=(1, 2))
+    priority = delta.detach().abs().mean(dim=2).sum(dim=1)
+    return per_sample, priority, z_sel.detach().mean(dim=1)
 
 
 def epsilon_at(cfg: DQNConfig, step: int) -> float:
@@ -353,6 +658,12 @@ def load_checkpoint(path: str | Path, device: str | torch.device | None = None) 
         dueling=dqn_cfg.dueling,
         channels=dqn_cfg.channels,
         depth=dqn_cfg.depth,
+        quantiles=dqn_cfg.quantiles,
+        noisy=dqn_cfg.noisy,
+        noisy_sigma=dqn_cfg.noisy_sigma,
+        encoder=dqn_cfg.encoder,
+        spectral_norm=dqn_cfg.spectral_norm,
+        n_cos=dqn_cfg.n_cos,
     ).to(device)
     net.load_state_dict(ck["state_dict"])
     net.eval()
@@ -426,8 +737,15 @@ def latest_round_dir(root: str | Path = "checkpoints") -> Path:
 
 # ---------------------------------------------------------------------------------------------- acting
 @torch.no_grad()
+def _autocast(device: torch.device | str):
+    """bf16 mixed precision on a GPU (about twice as fast for the residual encoder); a no-op on the CPU."""
+    dev = torch.device(device)
+    return torch.autocast("cuda", dtype=torch.bfloat16) if dev.type == "cuda" else contextlib.nullcontext()
+
+
 def greedy_actions(net: QNetwork, stacks: np.ndarray, device: torch.device) -> np.ndarray:
-    return net.greedy(torch.from_numpy(stacks).to(device, non_blocking=True)).cpu().numpy()
+    with _autocast(device):
+        return net.q_values(torch.from_numpy(stacks).to(device, non_blocking=True)).float().argmax(dim=1).cpu().numpy()
 
 
 @torch.no_grad()
@@ -524,19 +842,23 @@ def train_dqn(
     field_h = env_cfg.render.field_height
     def make_net() -> QNetwork:
         return QNetwork(cfg.frame_stack, obs_hw, field_h, grid_hw, n_keys, dueling=cfg.dueling,
-                        channels=cfg.channels, depth=cfg.depth).to(device)
+                        channels=cfg.channels, depth=cfg.depth, quantiles=cfg.quantiles, noisy=cfg.noisy,
+                        noisy_sigma=cfg.noisy_sigma, encoder=cfg.encoder, spectral_norm=cfg.spectral_norm,
+                        n_cos=cfg.n_cos).to(device)
 
     online, target = make_net(), make_net()
+    if device.type == "cuda":
+        online, target = online.to(memory_format=torch.channels_last), target.to(memory_format=torch.channels_last)
     opt = torch.optim.Adam(online.parameters(), lr=cfg.lr, eps=cfg.adam_eps)
     if resume is not None:
         r = resume.net
-        if (r.n_actions, r.in_frames, tuple(r.obs_hw), r.dueling, r.channels, r.depth) != (
-            n_actions, cfg.frame_stack, tuple(obs_hw), cfg.dueling, cfg.channels, cfg.depth
-        ):
+        mine = (n_actions, cfg.frame_stack, tuple(obs_hw), cfg.dueling, cfg.channels, cfg.depth, cfg.quantiles,
+                cfg.noisy, cfg.encoder)
+        theirs = (r.n_actions, r.in_frames, tuple(r.obs_hw), r.dueling, r.channels, r.depth, r.quantiles, r.noisy, r.encoder)
+        if mine != theirs:
             raise ValueError(
-                "Cannot resume: the checkpoint was trained with a different observation/action setup or network size "
-                f"(actions={r.n_actions}, frames={r.in_frames}, obs={tuple(r.obs_hw)}, dueling={r.dueling}, "
-                f"channels={r.channels}, depth={r.depth})"
+                "Cannot resume: the checkpoint was trained with a different observation/action setup or network "
+                f"(actions, frames, obs, dueling, channels, depth, quantiles, noisy, encoder = {theirs}, this round: {mine})"
             )
         online.load_state_dict(r.state_dict())
         if resume.opt_state:
@@ -546,7 +868,7 @@ def train_dqn(
         log(f"[dqn] resumed from round {round_no - 1} at {base_step:,} total steps -> starting round {round_no}")
     target.load_state_dict(online.state_dict())
     target.eval()
-    buf = ReplayBuffer(cfg.n_envs, cfg.buffer_size, obs_hw, cfg.frame_stack, cfg.n_step, cfg.gamma)
+    buf = ReplayBuffer(cfg.n_envs, cfg.buffer_size, obs_hw, cfg.frame_stack, cfg.n_step, cfg.gamma, alpha=cfg.per_alpha)
 
     stacks = np.zeros((cfg.n_envs, cfg.frame_stack, *obs_hw), dtype=np.uint8)
     for i, env in enumerate(envs):
@@ -558,6 +880,8 @@ def train_dqn(
         f"[dqn] device={device} grid={grid_hw[1]}x{grid_hw[0]} keys={n_keys} decision_hz={env_cfg.decision_hz:g} "
         f"obs={cfg.frame_stack}x{obs_hw[0]}x{obs_hw[1]} "
         f"net={cfg.channels}ch/depth {cfg.depth} ({sum(p.numel() for p in online.parameters()):,} parameters) "
+        f"btr: encoder={cfg.encoder}{'+sn' if cfg.spectral_norm else ''} quantiles={cfg.quantiles} "
+        f"munchausen={cfg.munchausen} noisy={cfg.noisy} dueling={cfg.dueling} per_alpha={cfg.per_alpha:g} "
         f"train_maps={len(train_maps)} val_maps={len(val_maps)} eval_maps={len(eval_set)}"
         + (f" (+{len(prev_set)} from the previous round)" if prev_set else "")
         + f" buffer={buf.C * cfg.n_envs:,} "
@@ -644,6 +968,8 @@ def train_dqn(
     online.train()
     while step < cfg.total_steps:
         eps = epsilon_at(cfg, step)
+        if cfg.noisy:
+            online.reset_noise()  # fresh exploration noise for every decision
         actions = greedy_actions(online, stacks, device)
         # epsilon-greedy: a random action aims at a uniformly random cell and holds a key (K1 or K2, 50/50)
         # only key_explore_prob of the time (osu! punishes spam clicking, so frequent random presses mostly miss)
@@ -673,29 +999,27 @@ def train_dqn(
             update_credit += cfg.n_envs * cfg.replay_ratio
             while update_credit >= 1.0:
                 update_credit -= 1.0
-                b = buf.sample(cfg.batch_size, rng)
+                beta = cfg.per_beta + (1.0 - cfg.per_beta) * min(step / max(cfg.total_steps, 1), 1.0)
+                b = buf.sample(cfg.batch_size, rng, beta=beta)
                 obs = torch.from_numpy(b["obs"]).to(device, non_blocking=True)
                 nxt = torch.from_numpy(b["next_obs"]).to(device, non_blocking=True)
                 act = torch.from_numpy(b["action"]).to(device)
                 ret = torch.from_numpy(b["ret"]).to(device)
                 disc = torch.from_numpy(b["disc"]).to(device)
-                q = online(obs).gather(1, act[:, None]).squeeze(1)
-                with torch.no_grad():
-                    q_next_t = target(nxt)
-                    if cfg.double:
-                        a_star = online(nxt).argmax(dim=1, keepdim=True)
-                        q_next = q_next_t.gather(1, a_star).squeeze(1)
-                    else:
-                        q_next = q_next_t.max(dim=1).values
-                    y = ret + disc * q_next
-                loss = F.smooth_l1_loss(q, y)
+                weight = torch.from_numpy(b["weight"]).to(device)
+                if cfg.noisy:
+                    online.reset_noise()
+                with _autocast(device):
+                    per_sample, priority, q_sel = td_loss(online, target, obs, act, ret, disc, nxt, cfg)
+                loss = (weight * per_sample).mean()
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(online.parameters(), cfg.grad_clip)
                 opt.step()
+                buf.update_priorities(b["index"], priority.cpu().numpy())
                 updates += 1
                 losses.append(float(loss.item()))
-                qs.append(float(q.mean().item()))
+                qs.append(float(q_sel.mean().item()))
                 if updates % cfg.target_update == 0:
                     target.load_state_dict(online.state_dict())
 
