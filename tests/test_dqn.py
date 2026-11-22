@@ -885,3 +885,26 @@ def test_spinner_frames_show_its_area_rotation_and_progress():
     assert np.isclose(env.spin_net[0], np.pi / 2, atol=0.05)
     assert px(frame, 256 + 140, 192) > px(frame, 256, 192 - 140) + 20  # the line now points right
     assert px(frame, 256 - 120, 192 + 40) > px(before, 256 - 120, 192 + 40)  # some progress: a brighter area
+
+
+def test_jumping_across_the_spinner_centre_spins_nothing():
+    """Cells come in pairs exactly opposite each other around the playfield centre, so a jump between them is exactly
+    180 degrees, which has no direction. Like lazer and the replay judge, the env keeps +180 and -180 as they are, so
+    jumping back and forth across the centre cancels out instead of counting as half a turn every jump."""
+    from osuai.replay import quantize_frames
+
+    cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
+    bm = parse_osu(_one_object_map("256,192,2000,8,0,5000\n256,192,8000,1,0"))
+    env = OsuEnv(MapData(bm, cfg), cfg, record=True)
+    env.reset(mode="full")
+    while env.t + cfg.dt_ms < 2000:
+        env.step_raw(267, 181, 0)
+    path = [(267, 181), (224, 224), (288, 160), (245, 203), (309, 139)]  # all on one line through (256, 192)
+    i = 0
+    while env.t + cfg.dt_ms < 5000:
+        env.step_raw(*path[(i // 2) % len(path)], KEY_K1)
+        i += 1
+    assert abs(env.spin_net[0]) < np.pi + 1e-6  # at most the half turn of a single unmatched jump
+    while not env.step_raw(256, 192, 0)[2]:
+        pass
+    assert judge_replay(bm, quantize_frames(env.frames)).spinner_spins_hit == 0

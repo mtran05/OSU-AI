@@ -589,7 +589,16 @@ class OsuEnv:
             if self.key_down_before and not math.isnan(prev) and t1 < md.ends[j]:
                 # signed: back-and-forth movement cancels out, as in lazer
                 before = abs(float(self.spin_net[j]))
-                self.spin_net[j] += (ang - prev + math.pi) % (2.0 * math.pi) - math.pi
+                # wrapped exactly as lazer's SpinnerRotationTracker (and the replay judge) do: only differences beyond
+                # +-180 degrees are wrapped, so a jump of exactly 180 (straight through the centre) keeps its sign and
+                # jumping back and forth across the centre cancels out. A modulo wrap would turn both +180 and -180
+                # into -180, counting every jump across the centre as half a turn the same way.
+                delta = ang - prev
+                if delta > math.pi:
+                    delta -= 2.0 * math.pi
+                elif delta < -math.pi:
+                    delta += 2.0 * math.pi
+                self.spin_net[j] += delta
                 gain = abs(float(self.spin_net[j])) - before  # paid as the net rotation grows; turning back costs it again
                 if gain > 0.0 and self.cfg.spin_max_deg > 0.0:
                     gain = min(gain, math.radians(self.cfg.spin_max_deg))

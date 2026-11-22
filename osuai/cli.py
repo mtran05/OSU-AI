@@ -155,7 +155,9 @@ def cmd_generate(args: argparse.Namespace) -> int:
         target = lo if args.count == 1 else lo + (hi - lo) * i / (args.count - 1)
         res = generate_map(target, ratio, length_s=args.length, seed=seed + i, tolerance=args.tolerance)
         dest = out_dir / f"{res.md5}.osu"
-        dest.write_text(res.text, encoding="utf-8")
+        # write the exact bytes res.md5 was computed from: write_text would turn "\n" into "\r\n" on Windows, and
+        # every reader identifies a map by the MD5 of its bytes, so the file name would no longer match
+        dest.write_bytes(res.text.encode("utf-8"))
         title = res.text.split("Title:", 1)[1].split("\n", 1)[0]
         entry = {
             "path": str(dest).replace("\\", "/"),
