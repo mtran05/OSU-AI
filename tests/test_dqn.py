@@ -933,3 +933,33 @@ def test_slider_ticks_are_decided_at_their_time_like_lazer():
     assert env.stats.ticks_missed >= 1  # the key was still up at the tick's time
     res = judge_replay(bm, quantize_frames(env.frames))
     assert (env.stats.ticks_hit, env.stats.ends_hit) == (res.slider_ticks_hit, res.slider_ends_hit)
+
+
+def test_network_width_and_depth_are_set_in_round_1_and_kept(tmp_path: Path, capsys, monkeypatch):
+    import pytest
+
+    from osuai.cli import main
+
+    cfg = EnvConfig()
+    sizes = {}
+    for ch, d in ((64, 3), (128, 3), (128, 4)):
+        net = QNetwork(4, cfg.obs_shape, cfg.render.field_height, (cfg.grid_h, cfg.grid_w), cfg.n_keys, channels=ch, depth=d)
+        assert net(torch.zeros(2, 4, *cfg.obs_shape, dtype=torch.uint8)).shape == (2, cfg.n_actions)
+        sizes[(ch, d)] = sum(p.numel() for p in net.parameters())
+    assert sizes[(64, 3)] == 145_125 or sizes[(64, 3)] < sizes[(128, 3)] < sizes[(128, 4)]
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "m.osu").write_text(COMPLEX_MAP, encoding="utf-8")
+    (tmp_path / "manifest.json").write_text(json.dumps({"maps": [{"path": str(tmp_path / "m.osu"), "star_rating": 3.0}]}), encoding="utf-8")
+    common = ["--maps", str(tmp_path / "manifest.json"), "--val-ratio", "0", "--envs", "2", "--buffer", "1000",
+              "--batch-size", "8", "--learning-starts", "100", "--eval-interval", "200", "--log-interval", "200"]
+    assert main(["train", *common, "--steps", "200", "--channels", "32", "--depth", "2", "--out", "small"]) == 0
+    assert main(["train", *common, "--steps", "200", "--resume", "small", "--out", "small2"]) == 0
+    ck = load_checkpoint(tmp_path / "small2" / "last.pt", device="cpu")
+    assert (ck.dqn_cfg.channels, ck.dqn_cfg.depth, ck.net.channels, ck.net.depth) == (32, 2, 32, 2)
+    for bad, match in ((["--channels", "64"], "--channels"), (["--depth", "3"], "--depth")):
+        with pytest.raises(ValueError, match=match):
+            main(["train", *common, "--steps", "50", "--resume", "small", *bad, "--out", "x"])
+    with pytest.raises(ValueError, match="--channels"):
+        main(["train", *common, "--steps", "50", "--channels", "1", "--out", "x"])
+    capsys.readouterr()

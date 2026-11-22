@@ -420,9 +420,13 @@ def cmd_train(args: argparse.Namespace) -> int:
             raise ValueError("--no-late-press cannot be used when resuming a checkpoint trained with late presses (it removes actions)")
         if args.dueling and not resume.dqn_cfg.dueling:
             raise ValueError("--dueling cannot be used when resuming a checkpoint trained without the dueling head")
+        for flag, val, ck_val in (("--channels", args.channels, resume.dqn_cfg.channels), ("--depth", args.depth, resume.dqn_cfg.depth)):
+            if val is not None and val != ck_val:
+                raise ValueError(f"{flag} {val} differs from the checkpoint ({ck_val}); the network's size cannot change when resuming")
         hz, width, action_repeat = rc.hz, rc.width, rc.action_repeat
         hud_rows, grid_w, grid_h, late_press = rc.hud_rows, rc.grid_w, rc.grid_h, rc.late_press
         frame_stack, dueling = resume.dqn_cfg.frame_stack, resume.dqn_cfg.dueling
+        channels, depth = resume.dqn_cfg.channels, resume.dqn_cfg.depth
         print(
             f"[train] resuming {resume_path}: round {len(resume.history) + 1}, "
             f"{resume.step:,} steps so far, previous maps: {len(resume.train_maps)}"
@@ -438,6 +442,12 @@ def cmd_train(args: argparse.Namespace) -> int:
         if frame_stack < 1:
             raise ValueError(f"--frame-stack must be at least 1, got {frame_stack}")
         dueling = args.dueling
+        channels = args.channels if args.channels is not None else DQNConfig().channels
+        depth = args.depth if args.depth is not None else DQNConfig().depth
+        if channels < 2:
+            raise ValueError(f"--channels must be at least 2, got {channels}")
+        if depth < 0:
+            raise ValueError(f"--depth must be 0 or more, got {depth}")
         _check_grid(grid_w, grid_h, width, hud_rows)
         # on by default; a late key needs a middle tick, so 1 tick per decision turns it off unless asked for explicitly
         if args.late_press and action_repeat < 2:
@@ -521,6 +531,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         double=not args.no_double,
         dueling=dueling,
         frame_stack=frame_stack,
+        channels=channels,
+        depth=depth,
         learning_starts=args.learning_starts,
         target_update=args.target_update,
         eps_decay_steps=args.eps_decay,
@@ -818,6 +830,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--hz", type=float, default=None, help="Simulation ticks per second of map time (default 60; fixed when resuming)")
     p_tr.add_argument("--action-repeat", type=int, default=None, help="Ticks per agent decision: 2 = 30 decisions/s (default 2; fixed when resuming)")
     p_tr.add_argument("--width", type=int, default=None, help="Rendered playfield width in pixels, height follows 4:3 (default 96; fixed when resuming)")
+    p_tr.add_argument(
+        "--channels", type=int, default=None,
+        help="Network width (default 64, about 145k parameters; 128 is about 4x). Round 1 only, kept when resuming",
+    )
+    p_tr.add_argument(
+        "--depth", type=int, default=None,
+        help="Layers after the two downsampling ones, each reaching twice as far (default 3: a cell sees about 64 frame "
+        "pixels around it; 4: about 128, the whole playfield width). Round 1 only, kept when resuming",
+    )
     p_tr.add_argument("--frame-stack", type=int, default=None, help="Frames of history the network sees: 4 at 30 decisions/s = the last 133 ms (default 4; round 1 only, kept when resuming)")
     p_tr.add_argument(
         "--late-press",

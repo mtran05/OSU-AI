@@ -59,6 +59,8 @@ class QNetwork(nn.Module):
         grid_hw: tuple[int, int],
         n_keys: int = 3,
         dueling: bool = False,
+        channels: int = 64,
+        depth: int = 3,
     ) -> None:
         super().__init__()
         self.in_frames = in_frames
@@ -71,19 +73,20 @@ class QNetwork(nn.Module):
         ys = torch.linspace(-1.0, 1.0, h).view(1, 1, h, 1).expand(1, 1, h, w)
         xs = torch.linspace(-1.0, 1.0, w).view(1, 1, 1, w).expand(1, 1, h, w)
         self.register_buffer("coords", torch.cat([xs, ys], dim=1).contiguous(), persistent=False)
-        c = 64
-        self.torso = nn.Sequential(
-            nn.Conv2d(in_frames + 2, 32, kernel_size=4, stride=2, padding=1),
+        self.channels, self.depth = int(channels), int(depth)
+        c, c0 = self.channels, max(1, self.channels // 2)
+        # two downsampling layers, then `depth` layers at the same size whose spacing doubles (1, 2, 4, 8, ...), so each
+        # one reaches twice as far: with depth 3 a cell sees about 64 frame pixels around it
+        layers: list[nn.Module] = [
+            nn.Conv2d(in_frames + 2, c0, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, c, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(c0, c, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(c, c, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(c, c, kernel_size=3, padding=2, dilation=2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(c, c, kernel_size=3, padding=4, dilation=4),
-            nn.ReLU(inplace=True),
-        )
+        ]
+        for k in range(self.depth):
+            d = 2**k
+            layers += [nn.Conv2d(c, c, kernel_size=3, padding=d, dilation=d), nn.ReLU(inplace=True)]
+        self.torso = nn.Sequential(*layers)
         self.context = nn.Sequential(nn.Linear(c, c), nn.ReLU(inplace=True))
         self.head = nn.Sequential(nn.Conv2d(2 * c, c, kernel_size=1), nn.ReLU(inplace=True), nn.Conv2d(c, n_keys, 1))
         if dueling:
@@ -243,6 +246,8 @@ class DQNConfig:
     n_step: int = 3
     double: bool = True
     dueling: bool = False
+    channels: int = 64  # network width (round 1 only; the first layer has half as many)
+    depth: int = 3  # layers after the two downsampling ones, each reaching twice as far (round 1 only)
     learning_starts: int = 20_000
     replay_ratio: float = 0.5  # gradient updates per environment transition (Atari DQN: 1 per 4 frames)
     target_update: int = 2_000  # gradient updates between target-network syncs
@@ -346,6 +351,8 @@ def load_checkpoint(path: str | Path, device: str | torch.device | None = None) 
         tuple(ck["grid_hw"]),
         int(ck["n_keys"]),
         dueling=dqn_cfg.dueling,
+        channels=dqn_cfg.channels,
+        depth=dqn_cfg.depth,
     ).to(device)
     net.load_state_dict(ck["state_dict"])
     net.eval()
@@ -515,15 +522,21 @@ def train_dqn(
     obs_hw = env_cfg.obs_shape
     grid_hw = (env_cfg.grid_h, env_cfg.grid_w)
     field_h = env_cfg.render.field_height
-    online = QNetwork(cfg.frame_stack, obs_hw, field_h, grid_hw, n_keys, dueling=cfg.dueling).to(device)
-    target = QNetwork(cfg.frame_stack, obs_hw, field_h, grid_hw, n_keys, dueling=cfg.dueling).to(device)
+    def make_net() -> QNetwork:
+        return QNetwork(cfg.frame_stack, obs_hw, field_h, grid_hw, n_keys, dueling=cfg.dueling,
+                        channels=cfg.channels, depth=cfg.depth).to(device)
+
+    online, target = make_net(), make_net()
     opt = torch.optim.Adam(online.parameters(), lr=cfg.lr, eps=cfg.adam_eps)
     if resume is not None:
         r = resume.net
-        if (r.n_actions, r.in_frames, tuple(r.obs_hw), r.dueling) != (n_actions, cfg.frame_stack, tuple(obs_hw), cfg.dueling):
+        if (r.n_actions, r.in_frames, tuple(r.obs_hw), r.dueling, r.channels, r.depth) != (
+            n_actions, cfg.frame_stack, tuple(obs_hw), cfg.dueling, cfg.channels, cfg.depth
+        ):
             raise ValueError(
-                "Cannot resume: the checkpoint was trained with a different observation/action setup "
-                f"(actions={r.n_actions}, frames={r.in_frames}, obs={tuple(r.obs_hw)}, dueling={r.dueling})"
+                "Cannot resume: the checkpoint was trained with a different observation/action setup or network size "
+                f"(actions={r.n_actions}, frames={r.in_frames}, obs={tuple(r.obs_hw)}, dueling={r.dueling}, "
+                f"channels={r.channels}, depth={r.depth})"
             )
         online.load_state_dict(r.state_dict())
         if resume.opt_state:
@@ -544,6 +557,7 @@ def train_dqn(
     log(
         f"[dqn] device={device} grid={grid_hw[1]}x{grid_hw[0]} keys={n_keys} decision_hz={env_cfg.decision_hz:g} "
         f"obs={cfg.frame_stack}x{obs_hw[0]}x{obs_hw[1]} "
+        f"net={cfg.channels}ch/depth {cfg.depth} ({sum(p.numel() for p in online.parameters()):,} parameters) "
         f"train_maps={len(train_maps)} val_maps={len(val_maps)} eval_maps={len(eval_set)}"
         + (f" (+{len(prev_set)} from the previous round)" if prev_set else "")
         + f" buffer={buf.C * cfg.n_envs:,} "
