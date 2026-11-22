@@ -860,3 +860,28 @@ def test_a_press_that_hits_nothing_costs_extra():
         until(env, press_at, 316, 192)
         env.step_raw(316, 192, KEY_K1)
         assert env.stats.empty_presses == 0
+
+
+def test_spinner_frames_show_its_area_rotation_and_progress():
+    cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
+    env = OsuEnv(MapData(parse_osu(_one_object_map("256,192,2000,8,0,5000\n256,192,8000,1,0")), cfg), cfg)
+    env.reset(mode="full")
+    while env.t + cfg.dt_ms < 2000:
+        env.step_raw(316, 192, 0)
+    s = cfg.render.scale
+
+    def px(frame, x, y):
+        return int(frame[int(y * s), int(x * s)])
+
+    before = env.step_raw(256, 100, 0)[0]
+    # the whole spinner area is filled, so a running spinner never looks like an empty screen
+    assert px(before, 256 + 120, 192) > 0 and px(before, 256 - 120, 192 + 40) > 0
+    # the line points up while nothing has been spun, and does not move while no key is held
+    up = px(before, 256, 192 - 120)
+    assert up > px(before, 256, 192 + 120) + 20
+    # spinning with a key held turns the line (a quarter turn clockwise on screen: it points right) and brightens the area
+    for a in np.linspace(-90, 0, 7):
+        frame = env.step_raw(256 + 80 * np.cos(np.radians(a)), 192 + 80 * np.sin(np.radians(a)), KEY_K1)[0]
+    assert np.isclose(env.spin_net[0], np.pi / 2, atol=0.05)
+    assert px(frame, 256 + 140, 192) > px(frame, 256, 192 - 140) + 20  # the line now points right
+    assert px(frame, 256 - 120, 192 + 40) > px(before, 256 - 120, 192 + 40)  # some progress: a brighter area

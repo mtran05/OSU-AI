@@ -638,5 +638,6 @@ class OsuEnv:
         k1 = bool(self.held_mask & KEY_K1)
         k2 = bool(self.held_mask & KEY_K2)
         return self.md.renderer.render(
-            self.t, self.x, self.y, k1, k2, self._visible(), self.head_pending, self.tracking
+            self.t, self.x, self.y, k1, k2, self._visible(), self.head_pending, self.tracking,
+            spin_rotation=self.spin_net, spins_required=self.md.spins_required,
         )
