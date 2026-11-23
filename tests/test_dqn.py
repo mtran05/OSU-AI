@@ -592,6 +592,34 @@ def test_slider_shaping_costs_offset_and_breaks():
     assert off_released.stats.slider_breaks == 1 and off_released.stats.ticks_missed > 0 and off_released.stats.ends_hit == 0
 
 
+def test_tapping_a_slider_head_and_letting_go_counts_as_a_break():
+    """A head tapped early and released before the slider starts is never tracked. That used to cost nothing but the
+    lost ticks and end, less than holding and slipping, so the agent learned to tap sliders like circles."""
+    cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
+    bm = parse_osu(_one_object_map("100,192,2000,2,0,L|400:192,1,300"))
+    obj = bm.objects[0]
+
+    def run(hold: bool) -> OsuEnv:
+        env = OsuEnv(MapData(bm, cfg), cfg)
+        env.reset(mode="full")
+        while env.t + cfg.dt_ms < obj.time - 25:
+            env.step_raw(100, 192, 0)
+        env.step_raw(100, 192, KEY_K1)  # the head, 8-25 ms early: a 300 at OD 5
+        done = False
+        while not done:
+            t1 = env.t + cfg.dt_ms
+            ball = obj.slider_pos_at_time(min(max(t1, obj.time), obj.end_time))
+            _, _, done, _ = env.step_raw(ball.x, ball.y, KEY_K1 if hold else 0)
+        return env
+
+    held, tapped = run(True), run(False)
+    # holding from an early head to the slider's start is no idle hold
+    assert held.stats.n300 == 1 and held.stats.ends_hit == 1 and held.stats.slider_breaks == 0
+    assert held.stats.idle_hold_ticks == 0
+    assert tapped.stats.n300 == 1 and tapped.stats.ends_hit == 0 and tapped.stats.slider_breaks == 1
+    assert tapped.stats.reward < held.stats.reward - cfg.slider_break_penalty - cfg.r_tail + 0.01
+
+
 def test_spinner_moves_count_under_the_keys_they_start_from():
     """Sliding along a line and holding the key only on the way back spins nothing in lazer: replay playback moves the
     cursor between frames under the keys of the frame it leaves. Env and judge must agree; circling still counts."""

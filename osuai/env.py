@@ -22,8 +22,8 @@ osuai/judge.py implements them in full detail; this is a fast version of the sam
 The reward is mostly positive game feedback (hit grades, slider ticks and ends, spinner rotation) with small costs
 for misses and key presses, plus optional potential-based aim shaping computed per decision
 (gamma * phi(s') - phi(s), which does not change the optimal policy). Two slider terms do change it on purpose:
-losing a tracked slider before its end costs slider_break_penalty at once (the combo break the game reward only shows
-ticks later), and every tick of a slider in progress costs a little for the cursor's distance from the ball
+losing a slider before its end costs slider_break_penalty at once (the combo break the game reward only shows ticks
+later), whether it was tracked and then lost or its hit head was let go before it was ever tracked, and every tick of a slider in progress costs a little for the cursor's distance from the ball
 (slider_offset_cost), keeping a margin for re-entering after a release. Spinner rotation is paid tick by tick as the net
 rotation grows, so the spinner's grade, which only comes at its end, is not the only signal. None of this is ever
 part of the observation.
@@ -91,7 +91,9 @@ class EnvConfig:
     # (the net rotation drifts away from zero), which draws an untrained agent into spinning; capped, it loses
     # reward on average, so the agent learns early on never to hold a key during spinners.
     spin_max_deg: float = 0.0
-    slider_break_penalty: float = 0.3  # a tracked slider lost before its end (key let go, or cursor out of the follow circle)
+    # a slider lost before its end: tracked and then lost (key let go, or cursor out of the follow circle), or its hit
+    # head let go before it was ever tracked
+    slider_break_penalty: float = 0.3
     slider_offset_cost: float = 1.0  # per second of a slider in progress at the follow circle's edge, linear in distance
 
     @property
@@ -181,7 +183,7 @@ class PlayStats:
     presses: int = 0
     combo: int = 0
     max_combo: int = 0
-    slider_breaks: int = 0  # tracked sliders lost before their end
+    slider_breaks: int = 0  # sliders lost before their end: tracked and then lost, or a hit head let go before tracking
     idle_hold_ticks: int = 0  # ticks with a key held while nothing needed one
     empty_presses: int = 0  # presses that hit nothing (see EnvConfig.empty_press_cost)
     reward: float = 0.0
@@ -286,6 +288,7 @@ class OsuEnv:
         self.tick_ptr = np.zeros(n, dtype=np.int32)
         self.slider_tracking = np.zeros(n, dtype=bool)
         self.slider_seen = np.zeros(n, dtype=bool)  # updated at least once since its head was judged
+        self.slider_picked = np.zeros(n, dtype=bool)  # tracked at least once, or already charged as dropped
         self.spin_net = np.zeros(n, dtype=np.float64)  # signed rotation in radians
         self.spin_prev = np.full(n, np.nan, dtype=np.float64)
         self.pending: list[tuple[float, float]] = []  # (map time it is paid at, reward) of early hits
@@ -446,6 +449,12 @@ class OsuEnv:
             elif kind == KIND_SPINNER:
                 key_needed = key_needed or t1 < md.ends[j]
                 reward += self._update_spinner(j, t1)
+        if not key_needed:
+            # a slider head hit early: its key has to stay down until the slider starts, so holding it is no idle hold
+            for j in range(hi_started, self.head_ptr):
+                if md.kinds[j] == KIND_SLIDER and self.head_hit[j] and not self.done[j]:
+                    key_needed = True
+                    break
         if self.key_down and not key_needed:
             self.stats.idle_hold_ticks += 1
             reward -= cfg.hold_cost * cfg.dt_ms / 1000.0
@@ -550,6 +559,15 @@ class OsuEnv:
             if was_tracking and not tracking:
                 self.stats.slider_breaks += 1
                 reward -= cfg.slider_break_penalty
+            elif not tracking and not self.key_down and self.head_hit[j] and not self.slider_picked[j]:
+                # dropped: the head was hit but the key let go before the slider was ever tracked (e.g. a head
+                # tapped early and released before the slider started). Without this, tapping a slider like a
+                # circle escaped the break penalty, and the agent learned never to hold sliders.
+                self.stats.slider_breaks += 1
+                reward -= cfg.slider_break_penalty
+                self.slider_picked[j] = True
+        if tracking:
+            self.slider_picked[j] = True
         if tracking:
             self.tracking = j
 

@@ -926,8 +926,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_tr.add_argument(
         "--slider-break-penalty", type=float, default=0.3,
-        help="Taken off the reward when a tracked slider is lost before its end: key let go or cursor out of the follow circle "
-        "(a positive number; 0 = off)",
+        help="Taken off the reward when a slider is lost before its end: key let go or cursor out of the follow circle, "
+        "or a hit head let go before the slider was ever tracked (a positive number; 0 = off)",
     )
     p_tr.add_argument(
         "--slider-offset-cost", type=float, default=1.0,
