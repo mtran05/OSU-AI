@@ -469,10 +469,10 @@ def cmd_train(args: argparse.Namespace) -> int:
         late_press = args.late_press if args.late_press is not None else action_repeat >= 2
         if args.late_press is None and not late_press:
             print("[train] late presses off: --action-repeat 1 has no middle tick to press on")
-    # noisy layers explore by themselves: random actions only in round 1's first steps (pressing keys rarely),
-    # and none when resuming; without them, the usual epsilon-greedy schedule
-    eps_start = args.eps_start if args.eps_start is not None else (1.0 if resume is None else (0.0 if noisy else 0.3))
-    eps_end = args.eps_end if args.eps_end is not None else (0.0 if noisy else 0.05)
+    # noisy layers do most of the exploring: a random phase in round 1 (pressing keys rarely), then a small floor of
+    # random actions, which resumed rounds keep from the start; without them, the usual epsilon-greedy schedule
+    eps_end = args.eps_end if args.eps_end is not None else (0.02 if noisy else 0.05)
+    eps_start = args.eps_start if args.eps_start is not None else (1.0 if resume is None else (eps_end if noisy else 0.3))
     if not 0.0 <= args.per_alpha <= 1.0 or not 0.0 <= args.per_beta <= 1.0:
         raise ValueError(f"--per-alpha and --per-beta must be within 0..1, got {args.per_alpha} and {args.per_beta}")
     round_no = len(resume.history) + 1 if resume is not None else 1
@@ -966,8 +966,8 @@ def build_parser() -> argparse.ArgumentParser:
         "next-state value instead of a max. Replaces Double DQN",
     )
     p_tr.add_argument(
-        "--replay-ratio", type=float, default=1 / 32,
-        help="Gradient updates per transition (default 1/32: one batch of 256 every 32 decisions, 8 samples per decision; "
+        "--replay-ratio", type=float, default=1 / 16,
+        help="Gradient updates per transition (default 1/16: one batch of 256 every 16 decisions, 16 samples per decision; "
         "BTR uses 1/64). Higher learns more per decision but each round takes longer",
     )
     p_tr.add_argument("--adam-eps", type=float, default=None, help="Adam epsilon (default 0.005 / batch size, as in BTR)")
@@ -992,8 +992,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--eps-start", type=float, default=None,
         help="Initial share of random actions (default 1.0 in round 1; when resuming 0 with noisy layers, else 0.3)",
     )
-    p_tr.add_argument("--eps-decay", type=int, default=250_000, help="Transitions over which epsilon decays eps-start -> eps-end")
-    p_tr.add_argument("--eps-end", type=float, default=None, help="Final share of random actions (default 0 with noisy layers, else 0.05)")
+    p_tr.add_argument("--eps-decay", type=int, default=1_000_000, help="Transitions over which epsilon decays eps-start -> eps-end")
+    p_tr.add_argument("--eps-end", type=float, default=None, help="Final share of random actions (default 0.02 with noisy layers, else 0.05)")
     p_tr.add_argument("--eval-interval", type=int, default=100_000, help="Transitions between validation evaluations")
     p_tr.add_argument(
         "--eval-maps", type=int, default=6,

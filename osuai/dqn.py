@@ -502,13 +502,16 @@ class DQNConfig:
     per_alpha: float = 0.2  # prioritized replay strength (0: uniform)
     per_beta: float = 0.4  # importance-weight correction, rising to 1 over each round
     learning_starts: int = 20_000
-    # gradient updates per environment transition: one batch of 256 every 32 decisions, 8 replayed samples per decision
-    # (BTR: 256 every 64, 4 per decision); keeps a 2M-decision round at about 3 hours with the residual encoder
-    replay_ratio: float = 1 / 32
+    # gradient updates per environment transition: one batch of 256 every 16 decisions, 16 replayed samples per decision
+    # (BTR: 256 every 64, 4 per decision, but over 50M decisions; at 1/32 a 2M-decision round learned too little before
+    # the random phase ended and the agent stopped pressing); a 2M-decision round takes about 4.5 hours
+    replay_ratio: float = 1 / 16
     target_update: int = 500  # gradient updates between target-network syncs
-    eps_start: float = 1.0  # with noisy layers, a short random phase only (it presses keys rarely, see key_explore_prob)
-    eps_end: float = 0.0  # 0.05 without noisy layers
-    eps_decay_steps: int = 250_000
+    eps_start: float = 1.0  # with noisy layers, a random phase in round 1 only (it presses keys rarely, see key_explore_prob)
+    # a small floor: with ε = 0 the agent learned that presses cost reward before it learned that hits pay, stopped
+    # pressing, and the noisy layers never made it press again; 2% random actions keep hits in the replay buffer
+    eps_end: float = 0.02  # 0.05 without noisy layers
+    eps_decay_steps: int = 1_000_000
     key_explore_prob: float = 0.2  # a random key action holds the key down this often (osu! punishes spam)
     grad_clip: float = 10.0
     eval_interval: int = 100_000
