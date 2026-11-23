@@ -23,6 +23,10 @@ out/
 *.pt
 *.pth
 
+# Remote training server
+server.json
+scripts/
+
 # Tooling / IDE
 .vscode/
 .idea/

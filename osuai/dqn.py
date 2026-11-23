@@ -475,10 +475,12 @@ class ReplayBuffer:
 # ---------------------------------------------------------------------------------------------- config
 @dataclass(slots=True)
 class DQNConfig:
-    total_steps: int = 2_000_000  # environment transitions (summed over parallel envs)
-    n_envs: int = 8
+    # Defaults favour what the agent learns over training speed: they are sized for a dedicated GPU
+    # (an NVIDIA A10 runs a round 1 in about 15 hours)
+    total_steps: int = 3_000_000  # environment transitions (summed over parallel envs)
+    n_envs: int = 32  # more games at once: less correlated data, and the simulation is cheap next to the updates
     frame_stack: int = 4
-    buffer_size: int = 300_000
+    buffer_size: int = 1_000_000  # as in BTR; about 7.3 GB of frames
     batch_size: int = 256
     lr: float = 1e-4
     adam_eps: float = 0.005 / 256  # BTR: 0.005 / batch size
@@ -486,8 +488,10 @@ class DQNConfig:
     n_step: int = 3
     double: bool = False  # Double DQN targets; BTR drops them, Munchausen targets replace them
     dueling: bool = True  # value + advantage streams (round 1 only)
-    channels: int = 64  # network width (round 1 only; the first stage has half as many)
-    depth: int = 3  # units after the two downsampling stages, each reaching twice as far (round 1 only)
+    # 128 channels and depth 4: about 2.1M parameters (BTR's Atari network has 2.9M), and every aim cell sees the
+    # whole playfield width; size is fixed after round 1, so it is chosen for the hardest maps, not the first ones
+    channels: int = 128  # network width (round 1 only; the first stage has half as many)
+    depth: int = 4  # units after the two downsampling stages, each reaching twice as far (round 1 only)
     encoder: str = "impala"  # "impala" (BTR's residual encoder) or "conv" (the original plain one); round 1 only
     spectral_norm: bool = True  # in the residual units (round 1 only)
     quantiles: int = 8  # IQN quantile levels sampled per state (0: one value per action); round 1 only
@@ -502,10 +506,10 @@ class DQNConfig:
     per_alpha: float = 0.2  # prioritized replay strength (0: uniform)
     per_beta: float = 0.4  # importance-weight correction, rising to 1 over each round
     learning_starts: int = 20_000
-    # gradient updates per environment transition: one batch of 256 every 16 decisions, 16 replayed samples per decision
-    # (BTR: 256 every 64, 4 per decision, but over 50M decisions; at 1/32 a 2M-decision round learned too little before
-    # the random phase ended and the agent stopped pressing); a 2M-decision round takes about 4.5 hours
-    replay_ratio: float = 1 / 16
+    # gradient updates per environment transition: one batch of 256 every 8 decisions, 32 replayed samples per decision,
+    # as many as the plain DQN that reached 98.5% on 0-3 star maps (BTR: 4 per decision, but over 50M decisions; at
+    # 1/32 a 2M-decision round learned too little before the random phase ended and the agent stopped pressing)
+    replay_ratio: float = 1 / 8
     target_update: int = 500  # gradient updates between target-network syncs
     eps_start: float = 1.0  # with noisy layers, a random phase in round 1 only (it presses keys rarely, see key_explore_prob)
     # a small floor: with ε = 0 the agent learned that presses cost reward before it learned that hits pay, stopped
@@ -515,7 +519,7 @@ class DQNConfig:
     key_explore_prob: float = 0.2  # a random key action holds the key down this often (osu! punishes spam)
     grad_clip: float = 10.0
     eval_interval: int = 100_000
-    eval_maps: int = 6  # validation maps per evaluation, spread over the round's star range
+    eval_maps: int = 12  # validation maps per evaluation, spread over the round's star range (more: a steadier best.pt)
     eval_seconds: float = 60.0
     log_interval: int = 10_000
     seed: int = 0

@@ -853,20 +853,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--max-stars", type=float, default=0.0, help="Only train on maps at or below this star rating (0 = no cap)")
     p_tr.add_argument("--limit-maps", type=int, default=0, help="Use only the first N matching maps (0 = all)")
     p_tr.add_argument("--val-ratio", type=float, default=0.1, help="Fraction of maps held out for validation")
-    p_tr.add_argument("--steps", type=int, default=2_000_000, help="Total environment transitions")
-    p_tr.add_argument("--envs", type=int, default=8, help="Parallel simulated games")
+    p_tr.add_argument("--steps", type=int, default=3_000_000, help="Total environment transitions")
+    p_tr.add_argument("--envs", type=int, default=32, help="Parallel simulated games")
     p_tr.add_argument("--resume", default=None, help="Continue from a previous round: its folder (uses last.pt) or a .pt file such as <folder>/best.pt")
     p_tr.add_argument("--hz", type=float, default=None, help="Simulation ticks per second of map time (default 60; fixed when resuming)")
     p_tr.add_argument("--action-repeat", type=int, default=None, help="Ticks per agent decision: 2 = 30 decisions/s (default 2; fixed when resuming)")
     p_tr.add_argument("--width", type=int, default=None, help="Rendered playfield width in pixels, height follows 4:3 (default 96; fixed when resuming)")
     p_tr.add_argument(
         "--channels", type=int, default=None,
-        help="Network width (default 64, about 145k parameters; 128 is about 4x). Round 1 only, kept when resuming",
+        help="Network width (default 128: about 2.1M parameters with depth 4; 64 has about a quarter as many). "
+        "Round 1 only, kept when resuming",
     )
     p_tr.add_argument(
         "--depth", type=int, default=None,
-        help="Layers after the two downsampling ones, each reaching twice as far (default 3: a cell sees about 64 frame "
-        "pixels around it; 4: about 128, the whole playfield width). Round 1 only, kept when resuming",
+        help="Layers after the two downsampling ones, each reaching twice as far (default 4: a cell sees about 128 frame "
+        "pixels around it, the whole playfield width; 3: about 64). Round 1 only, kept when resuming",
     )
     p_tr.add_argument("--frame-stack", type=int, default=None, help="Frames of history the network sees: 4 at 30 decisions/s = the last 133 ms (default 4; round 1 only, kept when resuming)")
     p_tr.add_argument(
@@ -934,7 +935,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Taken off the reward per second of a slider in progress with the cursor at the follow circle's edge, linear in "
         "distance from the ball (a positive number; 0 = off)",
     )
-    p_tr.add_argument("--buffer", type=int, default=300_000, help="Replay buffer size in transitions")
+    p_tr.add_argument("--buffer", type=int, default=1_000_000, help="Replay buffer size in transitions (about 7.3 GB at the default frame size)")
     p_tr.add_argument("--batch-size", type=int, default=256, help="Mini-batch size")
     p_tr.add_argument("--lr", type=float, default=1e-4, help="Adam learning rate")
     p_tr.add_argument("--gamma", type=float, default=0.9, help="Discount factor per decision (0.9 at 30 decisions/s looks ~1/3 s ahead)")
@@ -966,8 +967,8 @@ def build_parser() -> argparse.ArgumentParser:
         "next-state value instead of a max. Replaces Double DQN",
     )
     p_tr.add_argument(
-        "--replay-ratio", type=float, default=1 / 16,
-        help="Gradient updates per transition (default 1/16: one batch of 256 every 16 decisions, 16 samples per decision; "
+        "--replay-ratio", type=float, default=1 / 8,
+        help="Gradient updates per transition (default 1/8: one batch of 256 every 8 decisions, 32 samples per decision; "
         "BTR uses 1/64). Higher learns more per decision but each round takes longer",
     )
     p_tr.add_argument("--adam-eps", type=float, default=None, help="Adam epsilon (default 0.005 / batch size, as in BTR)")
@@ -996,7 +997,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--eps-end", type=float, default=None, help="Final share of random actions (default 0.02 with noisy layers, else 0.05)")
     p_tr.add_argument("--eval-interval", type=int, default=100_000, help="Transitions between validation evaluations")
     p_tr.add_argument(
-        "--eval-maps", type=int, default=6,
+        "--eval-maps", type=int, default=12,
         help="Validation maps per evaluation, spread over the round's star range (the previous round's are played too)",
     )
     p_tr.add_argument("--log-interval", type=int, default=10_000, help="Transitions between progress log lines")
