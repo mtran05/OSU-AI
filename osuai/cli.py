@@ -993,7 +993,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--eps-start", type=float, default=None,
         help="Initial share of random actions (default 1.0 in round 1; when resuming 0 with noisy layers, else 0.3)",
     )
-    p_tr.add_argument("--eps-decay", type=int, default=1_000_000, help="Transitions over which epsilon decays eps-start -> eps-end")
+    p_tr.add_argument("--eps-decay", type=int, default=500_000, help="Transitions over which epsilon decays eps-start -> eps-end")
     p_tr.add_argument("--eps-end", type=float, default=None, help="Final share of random actions (default 0.02 with noisy layers, else 0.05)")
     p_tr.add_argument("--eval-interval", type=int, default=100_000, help="Transitions between validation evaluations")
     p_tr.add_argument(
