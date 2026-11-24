@@ -514,7 +514,7 @@ class DQNConfig:
     eps_start: float = 1.0  # with noisy layers, a random phase in round 1 only (it presses keys rarely, see key_explore_prob)
     # a small floor: with ε = 0 the agent learned that presses cost reward before it learned that hits pay, stopped
     # pressing, and the noisy layers never made it press again; 2% random actions keep hits in the replay buffer
-    eps_end: float = 0.02  # 0.05 without noisy layers
+    eps_end: float = 0.02  # 0.05 without noisy layers; resumed rounds play with none (0, set by the CLI)
     # at replay ratio 1/8 the agent learns fast: with a 1M-step decay it was at 57% eval accuracy by 200k steps while
     # still acting at random 80% of the time, and only took off once ε neared its floor; 500k halves that wait
     eps_decay_steps: int = 500_000

@@ -68,8 +68,16 @@ class EnvConfig:
     hold_cost: float = 0.2
     # extra cost of a press that hits nothing: no circle or slider head judged, no slider in progress, no spinner
     # running or about to start. Pressing again right after a hit is otherwise nearly free, and when the cursor is
-    # already on the next object (or it is stacked on the same spot) that extra press hits it a beat early: a miss
+    # already on the next object (or it is stacked on the same spot) that extra press hits it a beat early: a miss.
+    # A second key going down while one is already held (a K1 <-> K2 switch) costs it even during a slider or spinner:
+    # the held key already tracks them, so a switch that hits nothing never helps. Exempt, a round 2 agent switched
+    # keys mid-slider on 26% of its presses, and switches into stacked notes caused half its early misses.
     empty_press_cost: float = 0.1
+    # bonus on top of a 300, largest for a press exactly on the object's time and falling linearly to 0 at the edge of
+    # the 300 window. Without it every press inside the window pays the same, so nothing pulls presses toward its
+    # centre; a round 2 agent hit with a 16-17 ms spread, slightly late, and at OD 8 (300 window +-32 ms) lost most of
+    # its accuracy to 100s. The bonus rewards a margin, which high-OD maps need.
+    timing_bonus: float = 0.2
     # 100 and 50 are worth 1/3 and 1/6 of a 300, the weights of lazer's accuracy, so timing matters as much as it
     # does to the score: a press one tick late that drops a 300 to a 100 loses two thirds of the hit
     # an early hit (before the object's time) is paid on the tick the object's time comes, not on the press: with
@@ -391,6 +399,7 @@ class OsuEnv:
 
         new_bits = mask & ~self.held_mask  # keys that went down this tick: each such tick is one tap
         pressed = new_bits != 0
+        switched = pressed and self.held_mask != 0  # a key went down while another was already held
         if pressed:
             self.last_bit = KEY_K2 if new_bits & KEY_K2 else KEY_K1
             self.stats.presses += 1
@@ -458,7 +467,9 @@ class OsuEnv:
         if self.key_down and not key_needed:
             self.stats.idle_hold_ticks += 1
             reward -= cfg.hold_cost * cfg.dt_ms / 1000.0
-        if pressed and not press_judged and not key_needed and not self._spinner_soon(t1):
+        # a press that judged nothing is wasted unless a slider or spinner needs a key going down (a fresh press can
+        # pick a slider back up after a release, or start a spinner); a switch never does: a key was already held
+        if pressed and not press_judged and (switched or (not key_needed and not self._spinner_soon(t1))):
             self.stats.empty_presses += 1
             reward -= cfg.empty_press_cost
         while self.lo < md.n and self.done[self.lo]:
@@ -522,6 +533,8 @@ class OsuEnv:
         else:
             self.stats.combo = 0
         reward = self._grade_reward(grade)
+        if grade == 300 and md.w300 > 0.0:  # centred presses pay a little more (see EnvConfig.timing_bonus)
+            reward += self.cfg.timing_bonus * max(0.0, 1.0 - abs(dt) / md.w300)
         if grade and dt < 0.0 and self.cfg.pay_hits_on_time:
             self.pending.append((float(md.times[j]), reward))  # paid when the object's time comes
             return 0.0

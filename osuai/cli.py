@@ -469,9 +469,10 @@ def cmd_train(args: argparse.Namespace) -> int:
         late_press = args.late_press if args.late_press is not None else action_repeat >= 2
         if args.late_press is None and not late_press:
             print("[train] late presses off: --action-repeat 1 has no middle tick to press on")
-    # noisy layers do most of the exploring: a random phase in round 1 (pressing keys rarely), then a small floor of
-    # random actions, which resumed rounds keep from the start; without them, the usual epsilon-greedy schedule
-    eps_end = args.eps_end if args.eps_end is not None else (0.02 if noisy else 0.05)
+    # noisy layers do most of the exploring: round 1 has a random phase (pressing keys rarely) down to a small floor,
+    # which keeps a fresh agent from learning never to press; a resumed agent already hits with its own policy, so it
+    # plays with no random actions at all, as BTR ends; without noisy layers, the usual epsilon-greedy schedule
+    eps_end = args.eps_end if args.eps_end is not None else (0.05 if not noisy else (0.02 if resume is None else 0.0))
     eps_start = args.eps_start if args.eps_start is not None else (1.0 if resume is None else (eps_end if noisy else 0.3))
     if not 0.0 <= args.per_alpha <= 1.0 or not 0.0 <= args.per_beta <= 1.0:
         raise ValueError(f"--per-alpha and --per-beta must be within 0..1, got {args.per_alpha} and {args.per_beta}")
@@ -498,7 +499,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     # --reward-* are signed: hits earn (0 or more), misses cost (0 or less), and a better grade never earns less
     for flag, value, sign in (
         ("--reward-300", args.reward_300, 1), ("--reward-100", args.reward_100, 1), ("--reward-50", args.reward_50, 1),
-        ("--reward-tick", args.reward_tick, 1), ("--reward-tail", args.reward_tail, 1),
+        ("--reward-tick", args.reward_tick, 1), ("--reward-tail", args.reward_tail, 1), ("--timing-bonus", args.timing_bonus, 1),
         ("--reward-miss", args.reward_miss, -1), ("--reward-tick-miss", args.reward_tick_miss, -1),
     ):
         if value * sign < 0:
@@ -526,6 +527,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         pay_hits_on_time=args.pay_hits_on_time,
         hold_cost=args.hold_cost,
         empty_press_cost=args.empty_press_cost,
+        timing_bonus=args.timing_bonus,
         r_spin=args.spin_reward,
         r_spin_bonus=args.spin_bonus,
         spin_max_deg=args.spin_max_deg,
@@ -887,7 +889,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument(
         "--empty-press-cost", type=float, default=0.1,
         help="Taken off the reward, on top of --press-penalty, for a press that hits nothing: no circle or slider head, "
-        "no slider in progress, no spinner running or about to start (a positive number; 0 = off)",
+        "no slider in progress, no spinner running or about to start; a K1/K2 switch while a key is held costs it even "
+        "during a slider or spinner (a positive number; 0 = off)",
+    )
+    p_tr.add_argument(
+        "--timing-bonus", type=float, default=0.2,
+        help="Extra reward for a 300, largest for a press exactly on time and falling to 0 at the edge of the 300 window, "
+        "so presses aim for the window's centre (0 or more; 0 = off)",
     )
     p_tr.add_argument(
         "--hold-cost", type=float, default=0.2,
@@ -994,7 +1002,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Initial share of random actions (default 1.0 in round 1; when resuming 0 with noisy layers, else 0.3)",
     )
     p_tr.add_argument("--eps-decay", type=int, default=500_000, help="Transitions over which epsilon decays eps-start -> eps-end")
-    p_tr.add_argument("--eps-end", type=float, default=None, help="Final share of random actions (default 0.02 with noisy layers, else 0.05)")
+    p_tr.add_argument("--eps-end", type=float, default=None, help="Final share of random actions (default with noisy layers: 0.02 in round 1, 0 when resuming; else 0.05)")
     p_tr.add_argument("--eval-interval", type=int, default=100_000, help="Transitions between validation evaluations")
     p_tr.add_argument(
         "--eval-maps", type=int, default=12,

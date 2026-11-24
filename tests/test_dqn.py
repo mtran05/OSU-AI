@@ -367,6 +367,10 @@ def test_cli_curriculum_round_folders(tmp_path: Path, capsys, monkeypatch):
     assert "resuming" in out and '"round": 2' in out and (r2 / "round.json").exists()
     r2_ck = load_checkpoint(r2 / "last.pt", device="cpu")
     assert r2_ck.step == load_checkpoint(r1 / "last.pt", device="cpu").step + 200
+    # round 1 explores down to a small floor; a resumed round plays with no random actions (noisy layers only)
+    r1_ck = load_checkpoint(r1 / "last.pt", device="cpu")
+    assert (r1_ck.dqn_cfg.eps_start, r1_ck.dqn_cfg.eps_end) == (1.0, 0.02)
+    assert (r2_ck.dqn_cfg.eps_start, r2_ck.dqn_cfg.eps_end) == (0.0, 0.0)
     assert r2_ck.history[-1]["resumed_from"].endswith("round1_0-4star/last.pt")
     assert latest_round_dir(tmp_path / "checkpoints") == r2
 
@@ -812,7 +816,8 @@ def test_early_hits_are_paid_at_the_objects_time():
     two = "256,192,2000,1,0\n256,192,4000,1,0"
 
     def run(pay_on_time: bool, press_at: float, obj: str = two, cut_after_press: bool = False) -> tuple[list[float], list[float], OsuEnv]:
-        cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False, pay_hits_on_time=pay_on_time)
+        # no timing bonus: these presses compare the hit's own reward (the bonus is tested on its own)
+        cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False, pay_hits_on_time=pay_on_time, timing_bonus=0.0)
         env = OsuEnv(MapData(parse_osu(_one_object_map(obj)), cfg), cfg)
         env.reset(mode="full")
         times, rewards, done = [], [], False
@@ -890,6 +895,42 @@ def test_a_press_that_hits_nothing_costs_extra():
         until(env, press_at, 316, 192)
         env.step_raw(316, 192, KEY_K1)
         assert env.stats.empty_presses == 0
+    # but switching K1 -> K2 while holding never helps a slider or spinner: the held key already counts
+    env = env_for(slider)
+    until(env, obj.time - 8, 100, 192)
+    while env.t + cfg.dt_ms < obj.time + 600:
+        t1 = env.t + cfg.dt_ms
+        b = obj.slider_pos_at_time(min(max(t1, obj.time), obj.end_time))
+        env.step_raw(b.x, b.y, KEY_K2 if t1 >= obj.time + 300 else KEY_K1)  # switch keys halfway, never letting go
+    assert env.stats.empty_presses == 1 and env.stats.presses == 2 and env.stats.slider_breaks == 0
+
+
+def test_timing_bonus_pays_most_for_a_centred_300():
+    """Inside the 300 window a press exactly on time earns timing_bonus more, falling linearly to 0 at its edge."""
+    cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
+    md = MapData(parse_osu(_one_object_map("256,192,2000,1,0\n256,192,4000,1,0")), cfg)
+
+    def hit_reward(dt: float) -> tuple[float, int]:
+        env = OsuEnv(md, cfg)
+        env.reset(mode="full")
+        env.pending.clear()
+        r = env._judge_head(0, dt) + env._pay_pending()  # early hits are held back until the object's time
+        return r, env.stats.n300
+
+    on_time, n = hit_reward(0.0)
+    assert n == 1 and np.isclose(on_time, cfg.r300 + cfg.timing_bonus)
+    half, _ = hit_reward(-md.w300 / 2)
+    assert np.isclose(half, cfg.r300 + cfg.timing_bonus / 2)
+    late_half, _ = hit_reward(md.w300 / 2)
+    assert np.isclose(late_half, half)  # early and late alike
+    edge, _ = hit_reward(md.w300)
+    assert np.isclose(edge, cfg.r300)
+    hundred, n = hit_reward(md.w300 + 1.0)
+    assert n == 0 and np.isclose(hundred, cfg.r100)  # no bonus outside the 300 window
+    off = EnvConfig(aim_shaping=0.0, skip_breaks=False, timing_bonus=0.0)
+    env = OsuEnv(MapData(parse_osu(_one_object_map("256,192,2000,1,0")), off), off)
+    env.reset(mode="full")
+    assert np.isclose(env._judge_head(0, 0.0), off.r300)
 
 
 def test_spinner_frames_show_its_area_rotation_and_progress():
