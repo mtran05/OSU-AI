@@ -418,11 +418,21 @@ def cmd_train(args: argparse.Namespace) -> int:
             if args.late_press:
                 raise ValueError("--late-press cannot be added when resuming a checkpoint trained without it (it adds actions)")
             raise ValueError("--no-late-press cannot be used when resuming a checkpoint trained with late presses (it removes actions)")
-        if args.dueling and not resume.dqn_cfg.dueling:
-            raise ValueError("--dueling cannot be used when resuming a checkpoint trained without the dueling head")
+        dc = resume.dqn_cfg
+        for flag, val, ck_val in (
+            ("--channels", args.channels, dc.channels), ("--depth", args.depth, dc.depth),
+            ("--dueling", args.dueling, dc.dueling), ("--noisy", args.noisy, dc.noisy),
+            ("--quantiles", args.quantiles, dc.quantiles), ("--encoder", args.encoder, dc.encoder),
+            ("--spectral-norm", args.spectral_norm, dc.spectral_norm),
+        ):
+            if val is not None and val != ck_val:
+                raise ValueError(f"{flag} {val} differs from the checkpoint ({ck_val}); the network cannot change when resuming")
         hz, width, action_repeat = rc.hz, rc.width, rc.action_repeat
         hud_rows, grid_w, grid_h, late_press = rc.hud_rows, rc.grid_w, rc.grid_h, rc.late_press
         frame_stack, dueling = resume.dqn_cfg.frame_stack, resume.dqn_cfg.dueling
+        channels, depth = resume.dqn_cfg.channels, resume.dqn_cfg.depth
+        quantiles, noisy, encoder, spectral_norm = dc.quantiles, dc.noisy, dc.encoder, dc.spectral_norm
+        noisy_sigma = dc.noisy_sigma
         print(
             f"[train] resuming {resume_path}: round {len(resume.history) + 1}, "
             f"{resume.step:,} steps so far, previous maps: {len(resume.train_maps)}"
@@ -437,7 +447,21 @@ def cmd_train(args: argparse.Namespace) -> int:
         frame_stack = args.frame_stack if args.frame_stack is not None else DQNConfig().frame_stack
         if frame_stack < 1:
             raise ValueError(f"--frame-stack must be at least 1, got {frame_stack}")
-        dueling = args.dueling
+        base = DQNConfig()
+        dueling = args.dueling if args.dueling is not None else base.dueling
+        noisy = args.noisy if args.noisy is not None else base.noisy
+        noisy_sigma = args.noisy_sigma if args.noisy_sigma is not None else base.noisy_sigma
+        quantiles = args.quantiles if args.quantiles is not None else base.quantiles
+        encoder = args.encoder if args.encoder is not None else base.encoder
+        spectral_norm = args.spectral_norm if args.spectral_norm is not None else base.spectral_norm
+        if quantiles < 0:
+            raise ValueError(f"--quantiles must be 0 (one value per action) or more, got {quantiles}")
+        channels = args.channels if args.channels is not None else DQNConfig().channels
+        depth = args.depth if args.depth is not None else DQNConfig().depth
+        if channels < 2:
+            raise ValueError(f"--channels must be at least 2, got {channels}")
+        if depth < 0:
+            raise ValueError(f"--depth must be 0 or more, got {depth}")
         _check_grid(grid_w, grid_h, width, hud_rows)
         # on by default; a late key needs a middle tick, so 1 tick per decision turns it off unless asked for explicitly
         if args.late_press and action_repeat < 2:
@@ -445,7 +469,13 @@ def cmd_train(args: argparse.Namespace) -> int:
         late_press = args.late_press if args.late_press is not None else action_repeat >= 2
         if args.late_press is None and not late_press:
             print("[train] late presses off: --action-repeat 1 has no middle tick to press on")
-    eps_start = args.eps_start if args.eps_start is not None else (0.3 if resume is not None else 1.0)
+    # noisy layers do most of the exploring: round 1 has a random phase (pressing keys rarely) down to a small floor,
+    # which keeps a fresh agent from learning never to press; a resumed agent already hits with its own policy, so it
+    # plays with no random actions at all, as BTR ends; without noisy layers, the usual epsilon-greedy schedule
+    eps_end = args.eps_end if args.eps_end is not None else (0.05 if not noisy else (0.02 if resume is None else 0.0))
+    eps_start = args.eps_start if args.eps_start is not None else (1.0 if resume is None else (eps_end if noisy else 0.3))
+    if not 0.0 <= args.per_alpha <= 1.0 or not 0.0 <= args.per_beta <= 1.0:
+        raise ValueError(f"--per-alpha and --per-beta must be within 0..1, got {args.per_alpha} and {args.per_beta}")
     round_no = len(resume.history) + 1 if resume is not None else 1
     run_dir = _prepare_round_dir(args.out, round_no, args.min_stars, args.max_stars, args.force)
     print(f"[train] round {round_no} -> {run_dir}")
@@ -469,7 +499,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     # --reward-* are signed: hits earn (0 or more), misses cost (0 or less), and a better grade never earns less
     for flag, value, sign in (
         ("--reward-300", args.reward_300, 1), ("--reward-100", args.reward_100, 1), ("--reward-50", args.reward_50, 1),
-        ("--reward-tick", args.reward_tick, 1), ("--reward-tail", args.reward_tail, 1),
+        ("--reward-tick", args.reward_tick, 1), ("--reward-tail", args.reward_tail, 1), ("--timing-bonus", args.timing_bonus, 1),
         ("--reward-miss", args.reward_miss, -1), ("--reward-tick-miss", args.reward_tick_miss, -1),
     ):
         if value * sign < 0:
@@ -497,6 +527,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         pay_hits_on_time=args.pay_hits_on_time,
         hold_cost=args.hold_cost,
         empty_press_cost=args.empty_press_cost,
+        timing_bonus=args.timing_bonus,
         r_spin=args.spin_reward,
         r_spin_bonus=args.spin_bonus,
         spin_max_deg=args.spin_max_deg,
@@ -518,15 +549,27 @@ def cmd_train(args: argparse.Namespace) -> int:
         lr=args.lr,
         gamma=args.gamma,
         n_step=args.n_step,
-        double=not args.no_double,
+        double=bool(args.double),
         dueling=dueling,
         frame_stack=frame_stack,
+        channels=channels,
+        depth=depth,
+        quantiles=quantiles,
+        encoder=encoder,
+        spectral_norm=spectral_norm,
+        munchausen=args.munchausen,
+        noisy=noisy,
+        noisy_sigma=noisy_sigma,
+        per_alpha=args.per_alpha,
+        per_beta=args.per_beta,
+        replay_ratio=args.replay_ratio,
+        adam_eps=args.adam_eps if args.adam_eps is not None else 0.005 / args.batch_size,
         learning_starts=args.learning_starts,
         target_update=args.target_update,
         eps_decay_steps=args.eps_decay,
         eps_start=eps_start,
         key_explore_prob=args.key_explore,
-        eps_end=args.eps_end,
+        eps_end=eps_end,
         eval_interval=args.eval_interval,
         eval_maps=args.eval_maps,
         log_interval=args.log_interval,
@@ -812,12 +855,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--max-stars", type=float, default=0.0, help="Only train on maps at or below this star rating (0 = no cap)")
     p_tr.add_argument("--limit-maps", type=int, default=0, help="Use only the first N matching maps (0 = all)")
     p_tr.add_argument("--val-ratio", type=float, default=0.1, help="Fraction of maps held out for validation")
-    p_tr.add_argument("--steps", type=int, default=2_000_000, help="Total environment transitions")
-    p_tr.add_argument("--envs", type=int, default=8, help="Parallel simulated games")
+    p_tr.add_argument("--steps", type=int, default=3_000_000, help="Total environment transitions")
+    p_tr.add_argument("--envs", type=int, default=32, help="Parallel simulated games")
     p_tr.add_argument("--resume", default=None, help="Continue from a previous round: its folder (uses last.pt) or a .pt file such as <folder>/best.pt")
     p_tr.add_argument("--hz", type=float, default=None, help="Simulation ticks per second of map time (default 60; fixed when resuming)")
     p_tr.add_argument("--action-repeat", type=int, default=None, help="Ticks per agent decision: 2 = 30 decisions/s (default 2; fixed when resuming)")
     p_tr.add_argument("--width", type=int, default=None, help="Rendered playfield width in pixels, height follows 4:3 (default 96; fixed when resuming)")
+    p_tr.add_argument(
+        "--channels", type=int, default=None,
+        help="Network width (default 128: about 2.1M parameters with depth 4; 64 has about a quarter as many). "
+        "Round 1 only, kept when resuming",
+    )
+    p_tr.add_argument(
+        "--depth", type=int, default=None,
+        help="Layers after the two downsampling ones, each reaching twice as far (default 4: a cell sees about 128 frame "
+        "pixels around it, the whole playfield width; 3: about 64). Round 1 only, kept when resuming",
+    )
     p_tr.add_argument("--frame-stack", type=int, default=None, help="Frames of history the network sees: 4 at 30 decisions/s = the last 133 ms (default 4; round 1 only, kept when resuming)")
     p_tr.add_argument(
         "--late-press",
@@ -836,7 +889,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument(
         "--empty-press-cost", type=float, default=0.1,
         help="Taken off the reward, on top of --press-penalty, for a press that hits nothing: no circle or slider head, "
-        "no slider in progress, no spinner running or about to start (a positive number; 0 = off)",
+        "no slider in progress, no spinner running or about to start; a K1/K2 switch while a key is held costs it even "
+        "during a slider or spinner (a positive number; 0 = off)",
+    )
+    p_tr.add_argument(
+        "--timing-bonus", type=float, default=0.2,
+        help="Extra reward for a 300, largest for a press exactly on time and falling to 0 at the edge of the 300 window, "
+        "so presses aim for the window's centre (0 or more; 0 = off)",
     )
     p_tr.add_argument(
         "--hold-cost", type=float, default=0.2,
@@ -876,31 +935,77 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_tr.add_argument(
         "--slider-break-penalty", type=float, default=0.3,
-        help="Taken off the reward when a tracked slider is lost before its end: key let go or cursor out of the follow circle "
-        "(a positive number; 0 = off)",
+        help="Taken off the reward when a slider is lost before its end: key let go or cursor out of the follow circle, "
+        "or a hit head let go before the slider was ever tracked (a positive number; 0 = off)",
     )
     p_tr.add_argument(
         "--slider-offset-cost", type=float, default=1.0,
         help="Taken off the reward per second of a slider in progress with the cursor at the follow circle's edge, linear in "
         "distance from the ball (a positive number; 0 = off)",
     )
-    p_tr.add_argument("--buffer", type=int, default=300_000, help="Replay buffer size in transitions")
-    p_tr.add_argument("--batch-size", type=int, default=64, help="Mini-batch size")
+    p_tr.add_argument("--buffer", type=int, default=1_000_000, help="Replay buffer size in transitions (about 7.3 GB at the default frame size)")
+    p_tr.add_argument("--batch-size", type=int, default=256, help="Mini-batch size")
     p_tr.add_argument("--lr", type=float, default=1e-4, help="Adam learning rate")
     p_tr.add_argument("--gamma", type=float, default=0.9, help="Discount factor per decision (0.9 at 30 decisions/s looks ~1/3 s ahead)")
     p_tr.add_argument("--n-step", type=int, default=3, help="n-step return length")
-    p_tr.add_argument("--no-double", action="store_true", help="Use vanilla max-Q targets instead of Double DQN")
-    p_tr.add_argument("--dueling", action="store_true", help="Add a dueling value/advantage split to the spatial Q-map")
+    p_tr.add_argument(
+        "--double", action=argparse.BooleanOptionalAction, default=False,
+        help="Double DQN targets (off by default; only used without --munchausen)",
+    )
+    p_tr.add_argument(
+        "--dueling", action=argparse.BooleanOptionalAction, default=None,
+        help="Dueling value/advantage split of the spatial Q-map (on by default; round 1 only, kept when resuming)",
+    )
+    p_tr.add_argument(
+        "--quantiles", type=int, default=None,
+        help="IQN head: quantile levels sampled per state (default 8; 0 = one value per action and a Huber loss). "
+        "Round 1 only, kept when resuming",
+    )
+    p_tr.add_argument(
+        "--encoder", choices=["impala", "conv"], default=None,
+        help="impala: BTR's residual encoder (default); conv: the original plain network. Round 1 only",
+    )
+    p_tr.add_argument(
+        "--spectral-norm", action=argparse.BooleanOptionalAction, default=None,
+        help="Spectral normalization in the IMPALA residual units (on by default; round 1 only)",
+    )
+    p_tr.add_argument(
+        "--munchausen", action=argparse.BooleanOptionalAction, default=True,
+        help="Munchausen targets (on by default): a bonus for actions the agent already rates highly, and a soft "
+        "next-state value instead of a max. Replaces Double DQN",
+    )
+    p_tr.add_argument(
+        "--replay-ratio", type=float, default=1 / 8,
+        help="Gradient updates per transition (default 1/8: one batch of 256 every 8 decisions, 32 samples per decision; "
+        "BTR uses 1/64). Higher learns more per decision but each round takes longer",
+    )
+    p_tr.add_argument("--adam-eps", type=float, default=None, help="Adam epsilon (default 0.005 / batch size, as in BTR)")
+    p_tr.add_argument(
+        "--noisy", action=argparse.BooleanOptionalAction, default=None,
+        help="Noisy layers in the output: learned noise explores instead of random actions (on by default; round 1 only)",
+    )
+    p_tr.add_argument("--noisy-sigma", type=float, default=None, help="Starting noise of the noisy layers (default 0.5; round 1 only)")
+    p_tr.add_argument(
+        "--per-alpha", type=float, default=0.2,
+        help="Prioritized replay: how strongly errors decide what is replayed (0 = uniform replay)",
+    )
+    p_tr.add_argument(
+        "--per-beta", type=float, default=0.4,
+        help="Prioritized replay: starting strength of the correction for non-uniform sampling; rises to 1 over the round",
+    )
     p_tr.add_argument("--max-speed", type=float, default=8000.0, help="Cursor speed cap in osu!px per second")
     p_tr.add_argument("--learning-starts", type=int, default=20_000, help="Transitions collected before learning starts")
-    p_tr.add_argument("--target-update", type=int, default=2_000, help="Gradient updates between target-network syncs")
+    p_tr.add_argument("--target-update", type=int, default=500, help="Gradient updates between target-network syncs")
     p_tr.add_argument("--key-explore", type=float, default=0.2, help="Probability that a random action holds a key (K1 or K2)")
-    p_tr.add_argument("--eps-start", type=float, default=None, help="Initial exploration epsilon (default 1.0, or 0.3 when resuming)")
-    p_tr.add_argument("--eps-decay", type=int, default=250_000, help="Transitions over which epsilon decays eps-start -> eps-end")
-    p_tr.add_argument("--eps-end", type=float, default=0.05, help="Final exploration epsilon")
+    p_tr.add_argument(
+        "--eps-start", type=float, default=None,
+        help="Initial share of random actions (default 1.0 in round 1; when resuming 0 with noisy layers, else 0.3)",
+    )
+    p_tr.add_argument("--eps-decay", type=int, default=500_000, help="Transitions over which epsilon decays eps-start -> eps-end")
+    p_tr.add_argument("--eps-end", type=float, default=None, help="Final share of random actions (default with noisy layers: 0.02 in round 1, 0 when resuming; else 0.05)")
     p_tr.add_argument("--eval-interval", type=int, default=100_000, help="Transitions between validation evaluations")
     p_tr.add_argument(
-        "--eval-maps", type=int, default=6,
+        "--eval-maps", type=int, default=12,
         help="Validation maps per evaluation, spread over the round's star range (the previous round's are played too)",
     )
     p_tr.add_argument("--log-interval", type=int, default=10_000, help="Transitions between progress log lines")

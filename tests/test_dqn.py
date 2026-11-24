@@ -328,6 +328,8 @@ def test_train_save_load_and_play(tmp_path: Path):
     assert set(again.all_train_maps) >= set(agent.all_train_maps) and set(again.all_val_maps) >= set(agent.all_val_maps)
     assert [h["round"] for h in again.history] == [1, 2] and again.history[1]["max_stars"] == 5.0
     for k, v in agent.net.state_dict().items():
+        if k.endswith("._u") or k.endswith("._v"):
+            continue  # spectral norm's power-iteration estimates are refined by every forward pass while acting
         assert torch.equal(v, again.net.state_dict()[k]), k
     assert (round1 / "best.pt").exists()  # earlier rounds are left untouched
 
@@ -365,6 +367,10 @@ def test_cli_curriculum_round_folders(tmp_path: Path, capsys, monkeypatch):
     assert "resuming" in out and '"round": 2' in out and (r2 / "round.json").exists()
     r2_ck = load_checkpoint(r2 / "last.pt", device="cpu")
     assert r2_ck.step == load_checkpoint(r1 / "last.pt", device="cpu").step + 200
+    # round 1 explores down to a small floor; a resumed round plays with no random actions (noisy layers only)
+    r1_ck = load_checkpoint(r1 / "last.pt", device="cpu")
+    assert (r1_ck.dqn_cfg.eps_start, r1_ck.dqn_cfg.eps_end) == (1.0, 0.02)
+    assert (r2_ck.dqn_cfg.eps_start, r2_ck.dqn_cfg.eps_end) == (0.0, 0.0)
     assert r2_ck.history[-1]["resumed_from"].endswith("round1_0-4star/last.pt")
     assert latest_round_dir(tmp_path / "checkpoints") == r2
 
@@ -590,6 +596,34 @@ def test_slider_shaping_costs_offset_and_breaks():
     assert off_released.stats.slider_breaks == 1 and off_released.stats.ticks_missed > 0 and off_released.stats.ends_hit == 0
 
 
+def test_tapping_a_slider_head_and_letting_go_counts_as_a_break():
+    """A head tapped early and released before the slider starts is never tracked. That used to cost nothing but the
+    lost ticks and end, less than holding and slipping, so the agent learned to tap sliders like circles."""
+    cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
+    bm = parse_osu(_one_object_map("100,192,2000,2,0,L|400:192,1,300"))
+    obj = bm.objects[0]
+
+    def run(hold: bool) -> OsuEnv:
+        env = OsuEnv(MapData(bm, cfg), cfg)
+        env.reset(mode="full")
+        while env.t + cfg.dt_ms < obj.time - 25:
+            env.step_raw(100, 192, 0)
+        env.step_raw(100, 192, KEY_K1)  # the head, 8-25 ms early: a 300 at OD 5
+        done = False
+        while not done:
+            t1 = env.t + cfg.dt_ms
+            ball = obj.slider_pos_at_time(min(max(t1, obj.time), obj.end_time))
+            _, _, done, _ = env.step_raw(ball.x, ball.y, KEY_K1 if hold else 0)
+        return env
+
+    held, tapped = run(True), run(False)
+    # holding from an early head to the slider's start is no idle hold
+    assert held.stats.n300 == 1 and held.stats.ends_hit == 1 and held.stats.slider_breaks == 0
+    assert held.stats.idle_hold_ticks == 0
+    assert tapped.stats.n300 == 1 and tapped.stats.ends_hit == 0 and tapped.stats.slider_breaks == 1
+    assert tapped.stats.reward < held.stats.reward - cfg.slider_break_penalty - cfg.r_tail + 0.01
+
+
 def test_spinner_moves_count_under_the_keys_they_start_from():
     """Sliding along a line and holding the key only on the way back spins nothing in lazer: replay playback moves the
     cursor between frames under the keys of the frame it leaves. Env and judge must agree; circling still counts."""
@@ -782,7 +816,8 @@ def test_early_hits_are_paid_at_the_objects_time():
     two = "256,192,2000,1,0\n256,192,4000,1,0"
 
     def run(pay_on_time: bool, press_at: float, obj: str = two, cut_after_press: bool = False) -> tuple[list[float], list[float], OsuEnv]:
-        cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False, pay_hits_on_time=pay_on_time)
+        # no timing bonus: these presses compare the hit's own reward (the bonus is tested on its own)
+        cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False, pay_hits_on_time=pay_on_time, timing_bonus=0.0)
         env = OsuEnv(MapData(parse_osu(_one_object_map(obj)), cfg), cfg)
         env.reset(mode="full")
         times, rewards, done = [], [], False
@@ -860,6 +895,42 @@ def test_a_press_that_hits_nothing_costs_extra():
         until(env, press_at, 316, 192)
         env.step_raw(316, 192, KEY_K1)
         assert env.stats.empty_presses == 0
+    # but switching K1 -> K2 while holding never helps a slider or spinner: the held key already counts
+    env = env_for(slider)
+    until(env, obj.time - 8, 100, 192)
+    while env.t + cfg.dt_ms < obj.time + 600:
+        t1 = env.t + cfg.dt_ms
+        b = obj.slider_pos_at_time(min(max(t1, obj.time), obj.end_time))
+        env.step_raw(b.x, b.y, KEY_K2 if t1 >= obj.time + 300 else KEY_K1)  # switch keys halfway, never letting go
+    assert env.stats.empty_presses == 1 and env.stats.presses == 2 and env.stats.slider_breaks == 0
+
+
+def test_timing_bonus_pays_most_for_a_centred_300():
+    """Inside the 300 window a press exactly on time earns timing_bonus more, falling linearly to 0 at its edge."""
+    cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
+    md = MapData(parse_osu(_one_object_map("256,192,2000,1,0\n256,192,4000,1,0")), cfg)
+
+    def hit_reward(dt: float) -> tuple[float, int]:
+        env = OsuEnv(md, cfg)
+        env.reset(mode="full")
+        env.pending.clear()
+        r = env._judge_head(0, dt) + env._pay_pending()  # early hits are held back until the object's time
+        return r, env.stats.n300
+
+    on_time, n = hit_reward(0.0)
+    assert n == 1 and np.isclose(on_time, cfg.r300 + cfg.timing_bonus)
+    half, _ = hit_reward(-md.w300 / 2)
+    assert np.isclose(half, cfg.r300 + cfg.timing_bonus / 2)
+    late_half, _ = hit_reward(md.w300 / 2)
+    assert np.isclose(late_half, half)  # early and late alike
+    edge, _ = hit_reward(md.w300)
+    assert np.isclose(edge, cfg.r300)
+    hundred, n = hit_reward(md.w300 + 1.0)
+    assert n == 0 and np.isclose(hundred, cfg.r100)  # no bonus outside the 300 window
+    off = EnvConfig(aim_shaping=0.0, skip_breaks=False, timing_bonus=0.0)
+    env = OsuEnv(MapData(parse_osu(_one_object_map("256,192,2000,1,0")), off), off)
+    env.reset(mode="full")
+    assert np.isclose(env._judge_head(0, 0.0), off.r300)
 
 
 def test_spinner_frames_show_its_area_rotation_and_progress():
@@ -908,3 +979,58 @@ def test_jumping_across_the_spinner_centre_spins_nothing():
     while not env.step_raw(256, 192, 0)[2]:
         pass
     assert judge_replay(bm, quantize_frames(env.frames)).spinner_spins_hit == 0
+
+
+def test_slider_ticks_are_decided_at_their_time_like_lazer():
+    """A tick between two ticks of the simulation is decided with the cursor partway between them and the keys of the
+    earlier one, as lazer plays a replay back: pressing again just after a tick does not earn it."""
+    from osuai.replay import quantize_frames
+
+    cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
+    # ticks at 2510 and 3010 ms; the early circle moves the start of play so the tick falls between two simulation
+    # ticks (if they coincide, the replay's whole-millisecond frame times put the new press exactly on the tick)
+    bm = parse_osu(_one_object_map("256,192,1000,1,0\n100,192,2010,2,0,L|400:192,1,300\n256,192,6000,1,0"))
+    obj = bm.objects[1]
+    tick = 2510.0
+    env = OsuEnv(MapData(bm, cfg), cfg, record=True)
+    env.reset(mode="full")
+    done = False
+    while not done and env.t < obj.end_time + 200:
+        t1 = env.t + cfg.dt_ms
+        b = obj.slider_pos_at_time(min(max(t1, obj.time), obj.end_time))
+        released = tick - 40 <= t1 < tick  # let go just before the tick; pressed again on the first tick after it
+        key = 0 if (t1 < obj.time - 8 or released) else KEY_K1
+        _, _, done, _ = env.step_raw(b.x, b.y, key)
+    assert env.stats.ticks_missed >= 1  # the key was still up at the tick's time
+    res = judge_replay(bm, quantize_frames(env.frames))
+    assert (env.stats.ticks_hit, env.stats.ends_hit) == (res.slider_ticks_hit, res.slider_ends_hit)
+
+
+def test_network_width_and_depth_are_set_in_round_1_and_kept(tmp_path: Path, capsys, monkeypatch):
+    import pytest
+
+    from osuai.cli import main
+
+    cfg = EnvConfig()
+    sizes = {}
+    for ch, d in ((64, 3), (128, 3), (128, 4)):
+        net = QNetwork(4, cfg.obs_shape, cfg.render.field_height, (cfg.grid_h, cfg.grid_w), cfg.n_keys, channels=ch, depth=d)
+        assert net(torch.zeros(2, 4, *cfg.obs_shape, dtype=torch.uint8)).shape == (2, cfg.n_actions)
+        sizes[(ch, d)] = sum(p.numel() for p in net.parameters())
+    assert sizes[(64, 3)] == 145_125 or sizes[(64, 3)] < sizes[(128, 3)] < sizes[(128, 4)]
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "m.osu").write_text(COMPLEX_MAP, encoding="utf-8")
+    (tmp_path / "manifest.json").write_text(json.dumps({"maps": [{"path": str(tmp_path / "m.osu"), "star_rating": 3.0}]}), encoding="utf-8")
+    common = ["--maps", str(tmp_path / "manifest.json"), "--val-ratio", "0", "--envs", "2", "--buffer", "1000",
+              "--batch-size", "8", "--learning-starts", "100", "--eval-interval", "200", "--log-interval", "200"]
+    assert main(["train", *common, "--steps", "200", "--channels", "32", "--depth", "2", "--out", "small"]) == 0
+    assert main(["train", *common, "--steps", "200", "--resume", "small", "--out", "small2"]) == 0
+    ck = load_checkpoint(tmp_path / "small2" / "last.pt", device="cpu")
+    assert (ck.dqn_cfg.channels, ck.dqn_cfg.depth, ck.net.channels, ck.net.depth) == (32, 2, 32, 2)
+    for bad, match in ((["--channels", "64"], "--channels"), (["--depth", "3"], "--depth")):
+        with pytest.raises(ValueError, match=match):
+            main(["train", *common, "--steps", "50", "--resume", "small", *bad, "--out", "x"])
+    with pytest.raises(ValueError, match="--channels"):
+        main(["train", *common, "--steps", "50", "--channels", "1", "--out", "x"])
+    capsys.readouterr()
