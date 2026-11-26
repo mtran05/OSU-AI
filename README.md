@@ -62,7 +62,7 @@ Accuracy on **held-out validation maps** the agent never trained on, with no exp
 | 1     | 0–3★ | 99.0%               | 175 | first BTR round (99.6% on its training maps)                       |
 | 2     | 0–5★ | 97.6%               | 162 | harder maps                                                        |
 | 3     | 0–5★ | 99.2%               | 130 | timing bonus, costly key switches, no random actions               |
-| 4     | 0–7★ | 99.1%               | 108 | harder maps with 11 of 40 validation maps at 100% (still training) |
+| 4     | 0–7★ | 99.4%               | 102 | harder maps; all 186 spinners on 0–3★ maps cleared (300s)          |
 
 ## Contents
 
