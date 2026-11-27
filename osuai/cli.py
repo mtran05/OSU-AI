@@ -493,6 +493,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         ("--empty-press-cost", args.empty_press_cost),
         ("--slider-break-penalty", args.slider_break_penalty),
         ("--slider-offset-cost", args.slider_offset_cost),
+        ("--arrival-cost", args.arrival_cost),
+        ("--arrival-lead", args.arrival_lead),
     ):
         if value < 0:
             raise ValueError(f"{flag} is an amount taken off the reward: pass a positive number (or 0 to turn it off), got {value}")
@@ -533,6 +535,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         spin_max_deg=args.spin_max_deg,
         slider_break_penalty=args.slider_break_penalty,
         slider_offset_cost=args.slider_offset_cost,
+        arrival_cost=args.arrival_cost,
+        arrival_lead_ms=args.arrival_lead,
         r300=args.reward_300,
         r100=args.reward_100,
         r50=args.reward_50,
@@ -942,6 +946,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--slider-offset-cost", type=float, default=1.0,
         help="Taken off the reward per second of a slider in progress with the cursor at the follow circle's edge, linear in "
         "distance from the ball (a positive number; 0 = off)",
+    )
+    p_tr.add_argument(
+        "--arrival-cost", type=float, default=1.0,
+        help="Taken off the reward per second the cursor is off the next circle or slider head during the last "
+        "--arrival-lead ms before its time (and until it is judged), unless a slider or spinner is in progress "
+        "(a positive number; 0 = off)",
+    )
+    p_tr.add_argument(
+        "--arrival-lead", type=float, default=50.0,
+        help="How long before a circle or slider head's time the cursor should already be on it, for --arrival-cost (ms)",
     )
     p_tr.add_argument("--buffer", type=int, default=1_000_000, help="Replay buffer size in transitions (about 7.3 GB at the default frame size)")
     p_tr.add_argument("--batch-size", type=int, default=256, help="Mini-batch size")

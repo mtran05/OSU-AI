@@ -209,7 +209,7 @@ python osuai/cli.py train --maps maps/imported maps/synthetic --max-stars 3
 python osuai/cli.py train --maps maps/circles maps/sliders --max-stars 4
 ```
 
-Rewards (`--reward-*`, `--spin-reward`, `--spin-bonus`, `--timing-bonus`) are signed: hits are 0 or more and misses 0 or less. Penalties and costs (`--press-penalty`, `--empty-press-cost`, `--hold-cost`, `--slider-break-penalty`, `--slider-offset-cost`) are positive amounts that are subtracted. `train` refuses a value with the wrong sign.
+Rewards (`--reward-*`, `--spin-reward`, `--spin-bonus`, `--timing-bonus`) are signed: hits are 0 or more and misses 0 or less. Penalties and costs (`--press-penalty`, `--empty-press-cost`, `--hold-cost`, `--slider-break-penalty`, `--slider-offset-cost`, `--arrival-cost`) are positive amounts that are subtracted. `train` refuses a value with the wrong sign.
 
 <details>
 <summary>Options: maps and rounds</summary>
@@ -279,6 +279,8 @@ Rewards (`--reward-*`, `--spin-reward`, `--spin-bonus`, `--timing-bonus`) are si
 | `--press-penalty <float>`                      | `0.03`    | Taken off the reward per key press, including switching K1 ↔ K2 while holding.                                                                                                                                                                                      |
 | `--empty-press-cost <float>`                   | `0.1`     | Taken off the reward, on top of `--press-penalty`, for a press that hits nothing: no circle or slider head, no slider in progress, no spinner running or about to start. A K1 ↔ K2 switch while a key is held costs it even during a slider or spinner (`0` = off). |
 | `--hold-cost <float>`                          | `0.2`     | Taken off the reward per second a key is held while nothing needs one: no slider in progress, no spinner running (`0` = off).                                                                                                                                       |
+| `--arrival-cost <float>`                       | `1.0`     | Taken off the reward per second the cursor is off the next circle or slider head during the last `--arrival-lead` ms before its time (and until it is judged), unless a slider or spinner is in progress (`0` = off).                                               |
+| `--arrival-lead <float>`                       | `50`      | How long before a circle or slider head's time the cursor should already be on it (ms).                                                                                                                                                                             |
 
 </details>
 

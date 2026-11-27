@@ -64,6 +64,7 @@ Accuracy on **held-out validation maps** the agent never trained on, with no exp
 | 3     | 0–5★ | 99.2%               | 130 | timing bonus, costly key switches, no random actions               |
 | 4     | 0–7★ | 99.4%               | 102 | harder maps; all 186 spinners on 0–3★ maps cleared (300s)          |
 | 5     | all  | 99.5%               | 105 | every map up to 11★; 10 of 40 validation maps at 100%              |
+| 6     | 5★+  | 99.7%               | —   | hard maps only: 6–7★ maps 99.0% → 99.7%, 7★+ maps 98.0% → 99.0%    |
 
 ## Contents
 
@@ -109,6 +110,7 @@ Mostly positive, like an Atari score:
 | key press                                                                                                                 | $`-0.03`$, including switching K1 ↔ K2 while holding                                                                                                                  |
 | press that hits nothing (no circle or slider head, no slider or spinner going), or a K1 ↔ K2 switch that hits nothing     | another $`-0.1`$                                                                                                                                                      |
 | key held while nothing needs one (no slider in progress, no spinner running)                                              | $`-0.2`$ per second                                                                                                                                                   |
+| cursor off the next circle or slider head in the last 50 ms before its time (no slider or spinner in progress)            | $`-1.0`$ per second                                                                                                                                                   |
 
 The rewards follow lazer's points (300 for a hit object, 150 for a slider end, 30 for a tick), scaled down. A 100 and a 50 are worth $`\tfrac{1}{3}`$ and $`\tfrac{1}{6}`$ of a 300, the same weights lazer's accuracy uses, so a press one tick off that turns a 300 into a 100 costs two thirds of the hit. Misses cost little, so the occasional hit still stands out while the agent is learning. On top of that, an optional _potential-based_ aim-shaping term, applied per decision,
 

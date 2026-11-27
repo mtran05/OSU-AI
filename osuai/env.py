@@ -103,6 +103,14 @@ class EnvConfig:
     # head let go before it was ever tracked
     slider_break_penalty: float = 0.3
     slider_offset_cost: float = 1.0  # per second of a slider in progress at the follow circle's edge, linear in distance
+    # per second the cursor is off the next circle or slider head during the last arrival_lead_ms before its time
+    # (and after it, until it is judged), unless a slider or spinner is still in progress. The aim shaping is
+    # potential-based, so it pays the same for a detour or a late start as for a straight early move, and a 300 pays
+    # the same whether the cursor arrived 100 ms or 5 ms early: a round 6 agent set off about 70 ms before a jump that
+    # takes 25 ms, wandered, and arrived after the object's time, which forced late presses (100s) and misses, most of
+    # them right after sliders. A small cost for being off the note just before its time asks for arrival with a margin.
+    arrival_cost: float = 1.0
+    arrival_lead_ms: float = 50.0
 
     @property
     def dt_ms(self) -> float:
@@ -194,6 +202,7 @@ class PlayStats:
     slider_breaks: int = 0  # sliders lost before their end: tracked and then lost, or a hit head let go before tracking
     idle_hold_ticks: int = 0  # ticks with a key held while nothing needed one
     empty_presses: int = 0  # presses that hit nothing (see EnvConfig.empty_press_cost)
+    late_arrival_ticks: int = 0  # ticks off the next object just before its time (see EnvConfig.arrival_cost)
     reward: float = 0.0
     steps: int = 0
 
@@ -458,6 +467,7 @@ class OsuEnv:
             elif kind == KIND_SPINNER:
                 key_needed = key_needed or t1 < md.ends[j]
                 reward += self._update_spinner(j, t1)
+        busy = key_needed  # a slider in progress or a spinner running: the cursor is needed there
         if not key_needed:
             # a slider head hit early: its key has to stay down until the slider starts, so holding it is no idle hold
             for j in range(hi_started, self.head_ptr):
@@ -472,6 +482,12 @@ class OsuEnv:
         if pressed and not press_judged and (switched or (not key_needed and not self._spinner_soon(t1))):
             self.stats.empty_presses += 1
             reward -= cfg.empty_press_cost
+        # be on the next circle or slider head a little before its time (see EnvConfig.arrival_cost)
+        j = self.head_ptr
+        if cfg.arrival_cost > 0.0 and not busy and j < md.n and self.head_pending[j] and t1 >= md.times[j] - cfg.arrival_lead_ms:
+            if math.hypot(self.x - md.px[j], self.y - md.py[j]) > md.radius:
+                self.stats.late_arrival_ticks += 1
+                reward -= cfg.arrival_cost * cfg.dt_ms / 1000.0
         while self.lo < md.n and self.done[self.lo]:
             self.lo += 1
 
