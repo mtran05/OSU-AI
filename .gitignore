@@ -31,3 +31,6 @@ scripts/
 .vscode/
 .idea/
 graphify-out/
+
+# Documentation / Report
+PDF/

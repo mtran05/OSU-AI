@@ -905,6 +905,56 @@ def test_a_press_that_hits_nothing_costs_extra():
     assert env.stats.empty_presses == 1 and env.stats.presses == 2 and env.stats.slider_breaks == 0
 
 
+def test_arrival_cost_asks_for_the_cursor_on_the_note_before_its_time():
+    """Off the next circle in the last arrival_lead_ms before its time costs arrival_cost per second; on it, or
+    earlier than that, or while a slider is still in progress, nothing."""
+    cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
+    per_tick = cfg.arrival_cost * cfg.dt_ms / 1000.0
+
+    def run(objs: str, path) -> OsuEnv:
+        env = OsuEnv(MapData(parse_osu(_one_object_map(objs)), cfg), cfg)
+        env.reset(mode="full")
+        while env.t + cfg.dt_ms < 2000 - 4:
+            t1 = env.t + cfg.dt_ms
+            env.step_raw(*path(t1), 0)
+        return env
+
+    # waiting off the circle until its time: charged for the ticks in the last 50 ms only
+    off = run("256,192,2000,1,0\n256,192,4000,1,0", lambda t: (50, 50))
+    lead_ticks = off.stats.late_arrival_ticks
+    assert 2 <= lead_ticks <= int(cfg.arrival_lead_ms / cfg.dt_ms) + 1
+    # on the circle the whole time: nothing
+    on = run("256,192,2000,1,0\n256,192,4000,1,0", lambda t: (256, 192))
+    assert on.stats.late_arrival_ticks == 0
+    assert np.isclose(on.stats.reward - off.stats.reward, lead_ticks * per_tick)
+    # arriving in time (by 60 ms before) after waiting elsewhere: nothing either
+    early = run("256,192,2000,1,0\n256,192,4000,1,0", lambda t: (256, 192) if t >= 2000 - 60 else (50, 50))
+    assert early.stats.late_arrival_ticks == 0
+    # a slider (1000-2500 ms) running into the next circle's window: following its ball is not charged; only the ticks
+    # after the slider is done (its end is judged within its last 36 ms) and before the circle are
+    long = EnvConfig(aim_shaping=0.0, skip_breaks=False, arrival_lead_ms=200.0)
+    slider = "100,192,1000,2,0,L|400:192,1,300\n256,300,2520,1,0"
+    md = MapData(parse_osu(_one_object_map(slider)), long)
+    obj = md.bm.objects[0]
+    env = OsuEnv(md, long)
+    env.reset(mode="full")
+    while env.t + long.dt_ms < obj.time - 8:
+        env.step_raw(100, 192, 0)
+    while env.t + long.dt_ms < 2520 - 4:
+        t1 = env.t + long.dt_ms
+        b = obj.slider_pos_at_time(min(max(t1, obj.time), obj.end_time))
+        env.step_raw(b.x, b.y, KEY_K1)
+    assert env.stats.ends_hit == 1
+    charged_ms = env.stats.late_arrival_ticks * long.dt_ms
+    assert 0 < charged_ms <= 2520 - md.tail_from[0] + long.dt_ms  # not the 200 ms window, just the time after the slider
+    off_cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False, arrival_cost=0.0)
+    env = OsuEnv(MapData(parse_osu(_one_object_map("256,192,2000,1,0")), off_cfg), off_cfg)
+    env.reset(mode="full")
+    while env.t + off_cfg.dt_ms < 2000 - 4:
+        env.step_raw(50, 50, 0)
+    assert env.stats.late_arrival_ticks == 0
+
+
 def test_timing_bonus_pays_most_for_a_centred_300():
     """Inside the 300 window a press exactly on time earns timing_bonus more, falling linearly to 0 at its edge."""
     cfg = EnvConfig(aim_shaping=0.0, skip_breaks=False)
