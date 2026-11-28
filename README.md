@@ -64,7 +64,8 @@ Accuracy on **held-out validation maps** the agent never trained on, with no exp
 | 3     | 0–5★ | 99.2%               | 130 | timing bonus, costly key switches, no random actions               |
 | 4     | 0–7★ | 99.4%               | 102 | harder maps; all 186 spinners on 0–3★ maps cleared (300s)          |
 | 5     | all  | 99.5%               | 105 | every map up to 11★; 10 of 40 validation maps at 100%              |
-| 6     | 5★+  | 99.7%               | —   | hard maps only: 6–7★ maps 99.0% → 99.7%, 7★+ maps 98.0% → 99.0%    |
+| 6     | 5★+  | 99.7%               | 103 | hard maps only: 6–7★ maps 99.0% → 99.7%, 7★+ maps 98.0% → 99.0%    |
+| 7     | all  | 99.6%               | 101 | early-arrival cost; on par with round 6, easy maps back to 99.9%   |
 
 ## Contents
 

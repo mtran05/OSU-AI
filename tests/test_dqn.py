@@ -361,7 +361,7 @@ def test_cli_curriculum_round_folders(tmp_path: Path, capsys, monkeypatch):
     capsys.readouterr()
 
     # resume from a round folder (its last.pt); the next folder is named after the new round and star range
-    assert main(["train", *common, "--max-stars", "5", "--steps", "200", "--resume", str(r1)]) == 0
+    assert main(["train", *common, "--max-stars", "5", "--steps", "200", "--resume", str(r1), "--lr-end", "1e-5"]) == 0
     out = capsys.readouterr().out
     r2 = tmp_path / "checkpoints" / "round2_0-5star"
     assert "resuming" in out and '"round": 2' in out and (r2 / "round.json").exists()
@@ -371,6 +371,9 @@ def test_cli_curriculum_round_folders(tmp_path: Path, capsys, monkeypatch):
     r1_ck = load_checkpoint(r1 / "last.pt", device="cpu")
     assert (r1_ck.dqn_cfg.eps_start, r1_ck.dqn_cfg.eps_end) == (1.0, 0.02)
     assert (r2_ck.dqn_cfg.eps_start, r2_ck.dqn_cfg.eps_end) == (0.0, 0.0)
+    # a decaying learning rate ends the round near --lr-end (a polishing round); round 1 kept a constant one
+    assert r1_ck.dqn_cfg.lr_end is None and r2_ck.dqn_cfg.lr_end == 1e-5
+    assert r2_ck.opt_state["param_groups"][0]["lr"] < 2e-5
     assert r2_ck.history[-1]["resumed_from"].endswith("round1_0-4star/last.pt")
     assert latest_round_dir(tmp_path / "checkpoints") == r2
 

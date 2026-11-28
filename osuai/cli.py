@@ -476,6 +476,8 @@ def cmd_train(args: argparse.Namespace) -> int:
     eps_start = args.eps_start if args.eps_start is not None else (1.0 if resume is None else (eps_end if noisy else 0.3))
     if not 0.0 <= args.per_alpha <= 1.0 or not 0.0 <= args.per_beta <= 1.0:
         raise ValueError(f"--per-alpha and --per-beta must be within 0..1, got {args.per_alpha} and {args.per_beta}")
+    if args.lr_end is not None and not 0.0 < args.lr_end <= args.lr:
+        raise ValueError(f"--lr-end must be above 0 and at most --lr ({args.lr}), got {args.lr_end}")
     round_no = len(resume.history) + 1 if resume is not None else 1
     run_dir = _prepare_round_dir(args.out, round_no, args.min_stars, args.max_stars, args.force)
     print(f"[train] round {round_no} -> {run_dir}")
@@ -551,6 +553,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         buffer_size=args.buffer,
         batch_size=args.batch_size,
         lr=args.lr,
+        lr_end=args.lr_end,
         gamma=args.gamma,
         n_step=args.n_step,
         double=bool(args.double),
@@ -959,7 +962,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_tr.add_argument("--buffer", type=int, default=1_000_000, help="Replay buffer size in transitions (about 7.3 GB at the default frame size)")
     p_tr.add_argument("--batch-size", type=int, default=256, help="Mini-batch size")
-    p_tr.add_argument("--lr", type=float, default=1e-4, help="Adam learning rate")
+    p_tr.add_argument("--lr", type=float, default=1e-4, help="Adam learning rate for the whole round; with --lr-end, the rate the round starts at")
+    p_tr.add_argument(
+        "--lr-end", type=float, default=None,
+        help="Learning rate at the end of the round: a cosine from --lr down to this (default: none, a constant --lr). "
+        "For a polishing round, e.g. 1e-5",
+    )
     p_tr.add_argument("--gamma", type=float, default=0.9, help="Discount factor per decision (0.9 at 30 decisions/s looks ~1/3 s ahead)")
     p_tr.add_argument("--n-step", type=int, default=3, help="n-step return length")
     p_tr.add_argument(

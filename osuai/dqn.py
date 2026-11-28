@@ -483,6 +483,10 @@ class DQNConfig:
     buffer_size: int = 1_000_000  # as in BTR; about 7.3 GB of frames
     batch_size: int = 256
     lr: float = 1e-4
+    # with a value, the learning rate follows a cosine from lr down to lr_end over the round (None: constant). For a
+    # polishing round: smaller steps late in the round make the value estimates less noisy, and the agent's fine
+    # choices (which tick to press on, when to leave a slider) depend on small differences between them
+    lr_end: float | None = None
     adam_eps: float = 0.005 / 256  # BTR: 0.005 / batch size
     gamma: float = 0.9  # short horizon: at 30 decisions/s this looks ~1/3 s ahead, enough to aim and press
     n_step: int = 3
@@ -535,7 +539,9 @@ class DQNConfig:
         # checkpoints from before BTR have none of its settings: they are plain DQN with the original encoder
         legacy = {"encoder": "conv", "spectral_norm": False, "quantiles": 0, "munchausen": False, "noisy": False,
                   "per_alpha": 0.0} if "encoder" not in d else {}
-        return cls(**{**legacy, **{k: v for k, v in d.items() if k in known}})
+        # checkpoints from before the size flags existed used 64 channels and depth 3 (the defaults then)
+        size = {k: v for k, v in (("channels", 64), ("depth", 3)) if k not in d}
+        return cls(**{**legacy, **size, **{k: v for k, v in d.items() if k in known}})
 
 
 def td_loss(
@@ -588,6 +594,14 @@ def td_loss(
 def epsilon_at(cfg: DQNConfig, step: int) -> float:
     frac = min(max(step / max(cfg.eps_decay_steps, 1), 0.0), 1.0)
     return cfg.eps_start + frac * (cfg.eps_end - cfg.eps_start)
+
+
+def lr_at(cfg: DQNConfig, step: int) -> float:
+    """Learning rate at a step of the round: constant, or with lr_end set, a cosine from lr down to lr_end."""
+    if cfg.lr_end is None:
+        return cfg.lr
+    frac = min(max(step / max(cfg.total_steps, 1), 0.0), 1.0)
+    return cfg.lr_end + 0.5 * (cfg.lr - cfg.lr_end) * (1.0 + math.cos(math.pi * frac))
 
 
 # ---------------------------------------------------------------------------------------------- checkpoint
@@ -1021,6 +1035,9 @@ def train_dqn(
                 with _autocast(device):
                     per_sample, priority, q_sel = td_loss(online, target, obs, act, ret, disc, nxt, cfg)
                 loss = (weight * per_sample).mean()
+                if cfg.lr_end is not None:
+                    for g in opt.param_groups:
+                        g["lr"] = lr_at(cfg, step)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(online.parameters(), cfg.grad_clip)
@@ -1041,6 +1058,7 @@ def train_dqn(
                 "total_step": base_step + step,
                 "updates": updates,
                 "eps": round(eps, 4),
+                "lr": float(f"{opt.param_groups[0]['lr']:.3g}"),
                 "sps": round(step / max(elapsed, 1e-9), 1),
                 "episodes": len(recent),
                 "ep_reward": round(float(np.mean([r["reward"] for r in recent])), 3) if recent else None,

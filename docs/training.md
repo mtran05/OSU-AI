@@ -42,6 +42,7 @@ python osuai/cli.py train --max-stars 7 --resume checkpoints/round2_0-5star  # -
 - **Keep easier maps in later rounds:** a range like `--max-stars 5` rather than `--min-stars 4 --max-stars 5` keeps them in the mix, so the agent doesn't forget them while learning harder maps.
 - **What carries over:** the replay buffer starts empty each round. `--steps` counts the new round only, while the step count stored in the checkpoint is cumulative.
 - **Exploration:** noisy layers do most of the exploring. Round 1 starts with a random phase ($`\varepsilon`$ from 1 to 0.02 over `--eps-decay` decisions, pressing keys only `--key-explore` of the time), and 2% of actions stay random after it. Resumed rounds play with no random actions ($`\varepsilon = 0`$), as BTR ends: the agent already hits with its own policy, and random actions only add noise to the data. Without the round 1 floor the agent learned that presses cost reward before it learned that hits pay, stopped pressing once $`\varepsilon`$ reached 0, and the noisy layers never got it pressing again. With `--no-noisy`, $`\varepsilon`$-greedy as before ($`\varepsilon`$ restarts at 0.3 when resuming).
+- **Polishing round:** once accuracy stops improving between rounds, `--lr-end` lowers the learning rate over the round, along a cosine from `--lr` (e.g. `--lr-end 1e-5`). Smaller steps late in the round make the value estimates less noisy, and the agent's finest choices, such as which tick to press on, depend on small differences between them.
 
 ## Round 1 settings
 
