@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from osuai.dqn import DQNConfig, NoisyLayer, QNetwork, ReplayBuffer, SumTree, td_loss
+from osuai.dqn import DQNConfig, NoisyLayer, QNetwork, ReplayBuffer, SumTree, lr_at, td_loss
 from osuai.env import EnvConfig
 
 ENV = EnvConfig(late_press=True)
@@ -126,6 +126,17 @@ def test_iqn_loss_trains_the_quantiles_toward_a_fixed_target():
         loss.mean().backward()
         opt.step()
     assert float(loss.detach().mean()) < 0.3 * first and prio.shape == (b,) and (prio >= 0).all()
+
+
+def test_learning_rate_is_constant_or_a_cosine_to_lr_end():
+    const = DQNConfig(lr=1e-4, total_steps=1000)
+    assert lr_at(const, 0) == lr_at(const, 500) == lr_at(const, 1000) == 1e-4
+    cos = DQNConfig(lr=1e-4, lr_end=1e-5, total_steps=1000)
+    assert np.isclose(lr_at(cos, 0), 1e-4) and np.isclose(lr_at(cos, 1000), 1e-5)
+    assert np.isclose(lr_at(cos, 500), 0.5 * (1e-4 + 1e-5))  # the middle of the cosine
+    assert np.isclose(lr_at(cos, 5000), 1e-5)  # past the end: stays at lr_end
+    steps = [lr_at(cos, s) for s in range(0, 1001, 50)]
+    assert all(a >= b for a, b in zip(steps, steps[1:]))  # never rises
 
 
 def test_old_configs_load_as_plain_dqn():
